@@ -30,7 +30,6 @@ def ensure_dir(directory):
 def fetch_and_prepare_data():
     ensure_dir(DATA_DIR)
     
-    # 1. Force Clean Slate: Remove old file to ensure fresh fetch
     if os.path.exists(DATA_FILE):
         os.remove(DATA_FILE)
     
@@ -42,7 +41,6 @@ def fetch_and_prepare_data():
     
     all_candles = []
     
-    # --- A. FETCH RAW DATA ---
     while since < end_ts:
         try:
             ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
@@ -61,7 +59,6 @@ def fetch_and_prepare_data():
             print(f"Error fetching data: {e}")
             break
 
-    # 2. Create DataFrame and Set Timestamp as Index
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
@@ -77,24 +74,20 @@ def fetch_and_prepare_data():
         return df
 
     # --- B. ADD DERIVATIVE COLUMNS (Aligned by Timestamp) ---
-    # pct_change() calculates change from t-1 to t. The result is placed at index t.
     deriv_cols = ['d_open', 'd_high', 'd_low', 'd_close']
     for col in ['open', 'high', 'low', 'close']:
         df[f'd_{col}'] = df[col].pct_change().fillna(0)
 
     # --- C. ADD NORMALIZED COLUMNS (Aligned by Timestamp) ---
-    # Normalize everything relative to the very first candle in this dataset
     first_vals = df.iloc[0]
     norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
     for col, n_col in zip(['open', 'high', 'low', 'close'], norm_cols):
         df[n_col] = df[col] / first_vals[col]
 
     # --- D. APPLY ROUNDING ---
-    # Rounding applies to the derivative and normalized columns we just created
     cols_to_round = deriv_cols + norm_cols
     df[cols_to_round] = (df[cols_to_round] / ROUNDING_STEP).round() * ROUNDING_STEP
 
-    # Save the Unified DataFrame
     df.to_csv(DATA_FILE)
     print(f"Unified Data Saved: {len(df)} rows.")
     
@@ -167,15 +160,11 @@ def run_backtest(deriv_rules, norm_rules, test_df):
     if len(test_df) < SEQ_LEN:
         return pd.DataFrame(), {}, [], []
 
-    # Extract aligned arrays from the Single DF
     d_data = test_df[['d_open', 'd_high', 'd_low', 'd_close']].values
     n_data = test_df[['n_open', 'n_high', 'n_low', 'n_close']].values
     
-    opens = test_df['open'].values
-    highs = test_df['high'].values
-    lows = test_df['low'].values
-    closes = test_df['close'].values
-    timestamps = test_df.index
+    # We will fetch candle details directly from the DataFrame by index
+    # to ensure perfect alignment.
     
     cumulative_pnl = 0.0
     wins = 0
@@ -185,18 +174,19 @@ def run_backtest(deriv_rules, norm_rules, test_df):
     dates = [test_df.index[0]]
 
     print("Running backtest...")
+    # Loop range: i represents the last candle of the input sequence.
+    # Prediction is made at close of i. Trade happens during i+1.
     for i in range(SEQ_LEN - 1, len(test_df) - 1):
-        # 1. Derivative Prediction
+        
+        # --- 1. PREDICTION LOGIC ---
         seq_array_d = d_data[i-SEQ_LEN+1 : i+1]
         seq_d = tuple(seq_array_d.flatten())
         pred_deriv = deriv_rules.get(seq_d, 'FLAT')
 
-        # 2. Normalized Prediction
         seq_array_n = n_data[i-SEQ_LEN+1 : i+1]
         seq_n = tuple(seq_array_n.flatten())
         pred_norm = norm_rules.get(seq_n, 'FLAT')
         
-        # 3. Consensus Logic
         final_pred = 'FLAT'
         if (pred_deriv == 'UP' and pred_norm == 'DOWN') or \
            (pred_deriv == 'DOWN' and pred_norm == 'UP'):
@@ -209,9 +199,11 @@ def run_backtest(deriv_rules, norm_rules, test_df):
             else:
                 final_pred = 'FLAT'
 
-        # Trade Execution
-        entry_price = opens[i+1]
-        exit_price = closes[i+1]
+        # --- 2. TRADE EXECUTION (Candle i+1) ---
+        # Access row i+1 for trade outcome
+        trade_candle = test_df.iloc[i+1]
+        entry_price = trade_candle['open']
+        exit_price = trade_candle['close']
         
         trade_pnl = 0.0
         if final_pred == 'UP':
@@ -225,23 +217,27 @@ def run_backtest(deriv_rules, norm_rules, test_df):
             if trade_pnl > 0: wins += 1
             
             pnl_history.append(cumulative_pnl)
-            dates.append(test_df.index[i+1])
+            dates.append(trade_candle.name) # .name gives the index (Timestamp)
             
+            # --- 3. RE-ADDED LOGGING LOGIC: INPUT & TARGET CANDLES ---
+            
+            # A. Input Sequence Candles (Indices: i-2, i-1, i)
             input_candles_str = ""
             for k in range(SEQ_LEN):
-                idx = i - SEQ_LEN + 1 + k
-                ts = timestamps[idx]
-                ts_str = ts.strftime('%Y-%m-%d %H:%M')
-                c_o = opens[idx]
-                c_h = highs[idx]
-                c_l = lows[idx]
-                c_c = closes[idx]
-                input_candles_str += f"[{k+1}] {ts_str} | O:{c_o:.0f} H:{c_h:.0f} L:{c_l:.0f} C:{c_c:.0f}<br>"
+                # Calculate integer location (iloc) for input candle
+                idx_loc = i - SEQ_LEN + 1 + k
+                row = test_df.iloc[idx_loc]
+                
+                ts_str = row.name.strftime('%Y-%m-%d %H:%M')
+                input_candles_str += f"[{k+1}] {ts_str} | O:{row['open']:.2f} H:{row['high']:.2f} L:{row['low']:.2f} C:{row['close']:.2f}<br>"
 
-            trade_ohlc_str = f"O:{entry_price:.0f} H:{highs[i+1]:.0f} L:{lows[i+1]:.0f} C:{exit_price:.0f}"
+            # B. Target Candle (Index: i+1)
+            # This is the candle where the trade actually happened.
+            trade_ts_str = trade_candle.name.strftime('%Y-%m-%d %H:%M')
+            trade_ohlc_str = f"{trade_ts_str}<br>O:{trade_candle['open']:.2f} H:{trade_candle['high']:.2f} L:{trade_candle['low']:.2f} C:{trade_candle['close']:.2f}"
             
             results.append({
-                'timestamp': test_df.index[i+1],
+                'timestamp': trade_candle.name,
                 'input_sequence_raw': input_candles_str,
                 'trade_candle_raw': trade_ohlc_str,
                 'pred_deriv': pred_deriv,
@@ -292,10 +288,6 @@ def generate_charts(df, pnl_dates, pnl_history):
     return base64.b64encode(img.getvalue()).decode()
 
 def generate_table_html(df_slice):
-    """
-    Helper to generate a consistent HTML table for a given dataframe slice.
-    Displays Raw, Normalized, and Derivative data columns side-by-side.
-    """
     html = '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
     html += '<thead class="thead-light">'
     html += '<tr>'
@@ -314,11 +306,8 @@ def generate_table_html(df_slice):
     
     for index, row in df_slice.iterrows():
         ts_str = index.strftime('%Y-%m-%d %H:%M')
-        # Raw (2 decimals)
         r_vals = f"<td>{row['open']:.2f}</td><td>{row['high']:.2f}</td><td>{row['low']:.2f}</td><td>{row['close']:.2f}</td>"
-        # Norm (4 decimals)
         n_vals = f"<td>{row['n_open']:.4f}</td><td>{row['n_high']:.4f}</td><td>{row['n_low']:.4f}</td><td>{row['n_close']:.4f}</td>"
-        # Deriv (4 decimals)
         d_vals = f"<td>{row['d_open']:.4f}</td><td>{row['d_high']:.4f}</td><td>{row['d_low']:.4f}</td><td>{row['d_close']:.4f}</td>"
         
         html += f"<tr><td>{ts_str}</td>{r_vals}{n_vals}{d_vals}</tr>"
@@ -329,18 +318,14 @@ def generate_table_html(df_slice):
 report_data = {}
 
 def main_logic():
-    # 1. Fetch, Prepare, and Unify Data
     df = fetch_and_prepare_data()
     if df.empty: 
         print("Error: No data fetched.")
         return
 
-    # 2. GENERATE HTML TABLES FOR VERIFICATION
-    # Capture the exact first 10 and last 10 rows from the Unified DataFrame
     report_data['first_10'] = generate_table_html(df.head(10))
     report_data['last_10'] = generate_table_html(df.tail(10))
     
-    # 3. Use this SINGLE aligned dataframe for Prediction
     deriv_rules, norm_rules, test_df, top_seq = build_sequences_and_predict(df)
     results_df, stats, dates, pnl_curve = run_backtest(deriv_rules, norm_rules, test_df)
     
