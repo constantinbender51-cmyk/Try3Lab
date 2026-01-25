@@ -14,12 +14,12 @@ from datetime import datetime, timedelta
 # --- Parameters ---
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-START_STR = '2026-01-01 00:00:00' # Adjusted to ensure data exists
+START_STR = '2023-01-01 00:00:00' 
 END_STR = None 
 B_SPLIT = 0.70
 C_TOP = 0.20
 D_LEN = 4 
-E_SIM = 1 # High threshold as requested
+E_SIM = 10000 
 API_PORT = 8080
 
 # Global state
@@ -49,6 +49,11 @@ def fetch(timeframe, symbol, start, end):
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
             if not ohlcv: break
+            
+            # --- PRINT API RESPONSE HERE ---
+            print(f"DEBUG: Sample Binance API Response (First Candle in Batch): {ohlcv[0]}")
+            # -------------------------------
+            
             all_ohlcv.extend(ohlcv)
             since = ohlcv[-1][0] + 1
             time.sleep(0.1)
