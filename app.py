@@ -30,6 +30,7 @@ def ensure_dir(directory):
 def fetch_and_prepare_data():
     ensure_dir(DATA_DIR)
     
+    # 1. Force Clean Slate: Remove old file to ensure fresh fetch
     if os.path.exists(DATA_FILE):
         os.remove(DATA_FILE)
     
@@ -41,6 +42,7 @@ def fetch_and_prepare_data():
     
     all_candles = []
     
+    # --- A. FETCH RAW DATA ---
     while since < end_ts:
         try:
             ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
@@ -59,6 +61,7 @@ def fetch_and_prepare_data():
             print(f"Error fetching data: {e}")
             break
 
+    # 2. Create DataFrame and Set Timestamp as Index
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     
@@ -163,9 +166,6 @@ def run_backtest(deriv_rules, norm_rules, test_df):
     d_data = test_df[['d_open', 'd_high', 'd_low', 'd_close']].values
     n_data = test_df[['n_open', 'n_high', 'n_low', 'n_close']].values
     
-    # We will fetch candle details directly from the DataFrame by index
-    # to ensure perfect alignment.
-    
     cumulative_pnl = 0.0
     wins = 0
     total_trades = 0
@@ -174,8 +174,6 @@ def run_backtest(deriv_rules, norm_rules, test_df):
     dates = [test_df.index[0]]
 
     print("Running backtest...")
-    # Loop range: i represents the last candle of the input sequence.
-    # Prediction is made at close of i. Trade happens during i+1.
     for i in range(SEQ_LEN - 1, len(test_df) - 1):
         
         # --- 1. PREDICTION LOGIC ---
@@ -200,7 +198,6 @@ def run_backtest(deriv_rules, norm_rules, test_df):
                 final_pred = 'FLAT'
 
         # --- 2. TRADE EXECUTION (Candle i+1) ---
-        # Access row i+1 for trade outcome
         trade_candle = test_df.iloc[i+1]
         entry_price = trade_candle['open']
         exit_price = trade_candle['close']
@@ -217,22 +214,18 @@ def run_backtest(deriv_rules, norm_rules, test_df):
             if trade_pnl > 0: wins += 1
             
             pnl_history.append(cumulative_pnl)
-            dates.append(trade_candle.name) # .name gives the index (Timestamp)
+            dates.append(trade_candle.name) 
             
-            # --- 3. RE-ADDED LOGGING LOGIC: INPUT & TARGET CANDLES ---
-            
-            # A. Input Sequence Candles (Indices: i-2, i-1, i)
+            # A. Input Sequence Candles
             input_candles_str = ""
             for k in range(SEQ_LEN):
-                # Calculate integer location (iloc) for input candle
                 idx_loc = i - SEQ_LEN + 1 + k
                 row = test_df.iloc[idx_loc]
                 
                 ts_str = row.name.strftime('%Y-%m-%d %H:%M')
                 input_candles_str += f"[{k+1}] {ts_str} | O:{row['open']:.2f} H:{row['high']:.2f} L:{row['low']:.2f} C:{row['close']:.2f}<br>"
 
-            # B. Target Candle (Index: i+1)
-            # This is the candle where the trade actually happened.
+            # B. Target Candle
             trade_ts_str = trade_candle.name.strftime('%Y-%m-%d %H:%M')
             trade_ohlc_str = f"{trade_ts_str}<br>O:{trade_candle['open']:.2f} H:{trade_candle['high']:.2f} L:{trade_candle['low']:.2f} C:{trade_candle['close']:.2f}"
             
@@ -288,8 +281,13 @@ def generate_charts(df, pnl_dates, pnl_history):
     return base64.b64encode(img.getvalue()).decode()
 
 def generate_table_html(df_slice):
-    html = '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
-    html += '<thead class="thead-light">'
+    """
+    Helper to generate a consistent HTML table for a given dataframe slice.
+    Includes a scrollable div wrapper.
+    """
+    html = '<div style="max-height: 500px; overflow-y: auto;">'
+    html += '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
+    html += '<thead class="thead-light" style="position: sticky; top: 0; z-index: 1;">'
     html += '<tr>'
     html += '<th rowspan="2" style="vertical-align: middle;">Timestamp (UTC)</th>'
     html += '<th colspan="4">Raw Binance Data (USD)</th>'
@@ -312,7 +310,7 @@ def generate_table_html(df_slice):
         
         html += f"<tr><td>{ts_str}</td>{r_vals}{n_vals}{d_vals}</tr>"
         
-    html += '</tbody></table>'
+    html += '</tbody></table></div>'
     return html
 
 report_data = {}
@@ -323,9 +321,17 @@ def main_logic():
         print("Error: No data fetched.")
         return
 
-    report_data['first_10'] = generate_table_html(df.head(10))
-    report_data['last_10'] = generate_table_html(df.tail(10))
+    # Filter for the specific range requested: Dec 29th 2025 to end of data (2026)
+    # Using string slicing with pandas datetime index
+    try:
+        # Start from Dec 29, 2025. End is implicit (end of data)
+        custom_slice = df.loc['2025-12-29':]
+        report_data['custom_range'] = generate_table_html(custom_slice)
+    except Exception as e:
+        print(f"Error slicing data: {e}")
+        report_data['custom_range'] = "<p>Error filtering data range.</p>"
     
+    # Run predictions
     deriv_rules, norm_rules, test_df, top_seq = build_sequences_and_predict(df)
     results_df, stats, dates, pnl_curve = run_backtest(deriv_rules, norm_rules, test_df)
     
@@ -381,14 +387,9 @@ def home():
         
         <div class="row">
             <div class="col-md-12">
-                <h3>Data Alignment Verification</h3>
-                <p>The tables below show the <strong>exact same index</strong> used for Raw, Normalized, and Derivative data.</p>
-                
-                <h4>First 10 Entries (Start of Dataset)</h4>
-                {report_data.get('first_10', '')}
-                
-                <h4>Last 10 Entries (End of Dataset)</h4>
-                {report_data.get('last_10', '')}
+                <h3>Unified Data Inspection</h3>
+                <p>Showing data from <strong>Dec 29, 2025 through 2026</strong> (Raw, Normalized, Derivative).</p>
+                {report_data.get('custom_range', '')}
             </div>
         </div>
         <hr>
