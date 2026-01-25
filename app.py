@@ -167,20 +167,21 @@ def run_backtest(prediction_rules, test_df):
 
     print("Running backtest...")
     for i in range(SEQ_LEN - 1, len(test_df) - 1):
+        # Sequence logic (Prediction inputs)
         seq_array = d_data[i-SEQ_LEN+1 : i+1]
         seq = tuple(seq_array.flatten())
         
         pred = prediction_rules.get(seq, 'FLAT')
         
-        # Trade happens on candle i+1
+        # --- Trade Execution Logic (Trade happens on candle i+1) ---
         entry_price = opens[i+1]
         exit_price = closes[i+1]
         
-        # Capture raw OHLC for verification
-        raw_o = entry_price
-        raw_h = highs[i+1]
-        raw_l = lows[i+1]
-        raw_c = exit_price
+        # Capture raw OHLC for verification of the TRADE candle
+        trade_o = entry_price
+        trade_h = highs[i+1]
+        trade_l = lows[i+1]
+        trade_c = exit_price
         
         trade_pnl = 0.0
         
@@ -197,12 +198,25 @@ def run_backtest(prediction_rules, test_df):
             pnl_history.append(cumulative_pnl)
             dates.append(test_df.index[i+1])
             
-            # Format Raw OHLC for table
-            raw_ohlc_str = f"O:{raw_o:.2f} H:{raw_h:.2f} L:{raw_l:.2f} C:{raw_c:.2f}"
+            # --- Capture Raw OHLC for the INPUT SEQUENCE (3 candles) ---
+            # Indices for input candles are: i-2, i-1, i (since SEQ_LEN=3)
+            # We iterate k from 0 to SEQ_LEN-1
+            input_candles_str = ""
+            for k in range(SEQ_LEN):
+                idx = i - SEQ_LEN + 1 + k
+                c_o = opens[idx]
+                c_h = highs[idx]
+                c_l = lows[idx]
+                c_c = closes[idx]
+                input_candles_str += f"[{k+1}] O:{c_o:.0f} H:{c_h:.0f} L:{c_l:.0f} C:{c_c:.0f}<br>"
+
+            # Format Raw Trade Candle for table
+            trade_ohlc_str = f"O:{trade_o:.0f} H:{trade_h:.0f} L:{trade_l:.0f} C:{trade_c:.0f}"
             
             results.append({
                 'timestamp': test_df.index[i+1],
-                'raw_trade_ohlc': raw_ohlc_str,
+                'input_sequence_raw': input_candles_str,
+                'trade_candle_raw': trade_ohlc_str,
                 'prediction': pred,
                 'pnl': round(trade_pnl * 100, 2),
                 'cum_pnl': round(cumulative_pnl * 100, 2)
@@ -282,8 +296,8 @@ def main_logic():
     report_data['plot'] = plot_url
     report_data['top_sequences'] = seq_df.to_html(classes='table table-bordered table-sm', escape=False, index=False)
     if not results_df.empty:
-        # Added table-sm to help fit the new column
-        report_data['table'] = results_df.tail(20).to_html(classes='table table-striped table-sm', index=False)
+        # Pass escape=False so the <br> tags in input_sequence_raw are rendered
+        report_data['table'] = results_df.tail(20).to_html(classes='table table-striped table-sm', index=False, escape=False)
     else:
         report_data['table'] = "<p>No trades executed in test set.</p>"
 
@@ -300,8 +314,12 @@ def home():
         <style>
             body{{ padding: 20px; }}
             .chart-container {{ margin-bottom: 30px; }}
-            /* Ensure the raw OHLC column doesn't break layout too much */
-            td {{ vertical-align: middle !important; font-size: 0.9rem; }}
+            
+            /* Table formatting */
+            td {{ vertical-align: middle !important; font-size: 0.85rem; }}
+            
+            /* Make the input sequence column slightly wider/smaller text to fit 3 lines */
+            td small {{ display: block; line-height: 1.2; }}
         </style>
     </head>
     <body>
