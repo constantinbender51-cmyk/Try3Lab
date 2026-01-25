@@ -30,9 +30,8 @@ def ensure_dir(directory):
 def fetch_data():
     ensure_dir(DATA_DIR)
     
-    # --- FORCE DATA REFRESH ---
+    # Force delete to ensure fresh data alignment
     if os.path.exists(DATA_FILE):
-        print(f"Removing cached data file {DATA_FILE} to force fresh fetch...")
         os.remove(DATA_FILE)
     
     print(f"Fetching fresh data for {SYMBOL} from Binance ({START_DATE} to {END_DATE})...")
@@ -45,11 +44,8 @@ def fetch_data():
     
     while since < end_ts:
         try:
-            # Fetch Spot Data
             ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
-            if not ohlcv: 
-                print("No more data received.")
-                break
+            if not ohlcv: break
             
             all_candles.extend(ohlcv)
             last_timestamp = ohlcv[-1][0]
@@ -68,28 +64,38 @@ def fetch_data():
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     
+    # Strict filtering and sorting
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep='first')]
     mask = (df.index >= pd.Timestamp(START_DATE)) & (df.index < pd.Timestamp(END_DATE))
     df = df.loc[mask]
     
     df.to_csv(DATA_FILE)
-    print(f"Successfully saved {len(df)} fresh rows to {DATA_FILE}")
-        
+    print(f"Data fetched and saved: {len(df)} rows.")
     return df
 
-def prepare_data(df):
-    # 3. Create derivative version
+def prepare_single_df(df):
+    """
+    Creates a single DataFrame containing Raw, Normalized, and Derivative data.
+    Ensures all columns have the same length (aligned by index).
+    """
+    # 1. Raw Data is already in 'df' (open, high, low, close)
+    
+    # 2. Add Derivative Columns (fill NaN at index 0 to maintain length)
     deriv_cols = ['d_open', 'd_high', 'd_low', 'd_close']
     for col in ['open', 'high', 'low', 'close']:
+        # pct_change() puts NaN in the first row. We fill with 0 to keep the row count identical.
         df[f'd_{col}'] = df[col].pct_change().fillna(0)
 
-    # 5. Divide raw ohlc by first candle (Normalize)
+    # 3. Add Normalized Columns
+    # We normalize against the very first entry of the loaded dataset
     if len(df) > 0:
         first_vals = df.iloc[0]
         norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
         for col, n_col in zip(['open', 'high', 'low', 'close'], norm_cols):
             df[n_col] = df[col] / first_vals[col]
 
-        # 6. Round raw ohlc (normalized) and derivative version to 0.2%
+        # 4. Rounding (Only apply to Derivative and Normalized columns)
         cols_to_round = deriv_cols + norm_cols
         df[cols_to_round] = (df[cols_to_round] / ROUNDING_STEP).round() * ROUNDING_STEP
 
@@ -100,6 +106,7 @@ def train_model(train_df, input_cols):
     data_values = train_df[input_cols].values
     train_outcomes = (train_df['close'].shift(-1) - train_df['close']) / train_df['close']
     
+    # Stop before the last row because we need outcome (i+1)
     for i in range(SEQ_LEN - 1, len(train_df) - 1):
         seq_array = data_values[i-SEQ_LEN+1 : i+1] 
         seq = tuple(seq_array.flatten()) 
@@ -139,6 +146,7 @@ def build_sequences_and_predict(df):
     if len(df) < SEQ_LEN:
         return {}, {}, df, []
 
+    # Use the unified DF for splitting
     split_idx = int(len(df) * 0.8)
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
@@ -161,6 +169,7 @@ def run_backtest(deriv_rules, norm_rules, test_df):
     if len(test_df) < SEQ_LEN:
         return pd.DataFrame(), {}, [], []
 
+    # Extract aligned arrays from the Single DF
     d_data = test_df[['d_open', 'd_high', 'd_low', 'd_close']].values
     n_data = test_df[['n_open', 'n_high', 'n_low', 'n_close']].values
     
@@ -177,21 +186,20 @@ def run_backtest(deriv_rules, norm_rules, test_df):
     pnl_history = [0]
     dates = [test_df.index[0]]
 
-    print("Running backtest with Dual Models (Raw + Derivative)...")
+    print("Running backtest...")
     for i in range(SEQ_LEN - 1, len(test_df) - 1):
-        # 1. Get Derivative Prediction
+        # 1. Derivative Prediction
         seq_array_d = d_data[i-SEQ_LEN+1 : i+1]
         seq_d = tuple(seq_array_d.flatten())
         pred_deriv = deriv_rules.get(seq_d, 'FLAT')
 
-        # 2. Get Raw Normalized Prediction
+        # 2. Normalized Prediction
         seq_array_n = n_data[i-SEQ_LEN+1 : i+1]
         seq_n = tuple(seq_array_n.flatten())
         pred_norm = norm_rules.get(seq_n, 'FLAT')
         
-        # 3. Apply Consensus/Conflict Logic
+        # 3. Consensus Logic
         final_pred = 'FLAT'
-        
         if (pred_deriv == 'UP' and pred_norm == 'DOWN') or \
            (pred_deriv == 'DOWN' and pred_norm == 'UP'):
             final_pred = 'FLAT' 
@@ -203,17 +211,11 @@ def run_backtest(deriv_rules, norm_rules, test_df):
             else:
                 final_pred = 'FLAT'
 
-        # --- Trade Execution Logic ---
+        # Trade Execution
         entry_price = opens[i+1]
         exit_price = closes[i+1]
         
-        trade_o = entry_price
-        trade_h = highs[i+1]
-        trade_l = lows[i+1]
-        trade_c = exit_price
-        
         trade_pnl = 0.0
-        
         if final_pred == 'UP':
             trade_pnl = (exit_price - entry_price) / entry_price
         elif final_pred == 'DOWN':
@@ -232,14 +234,13 @@ def run_backtest(deriv_rules, norm_rules, test_df):
                 idx = i - SEQ_LEN + 1 + k
                 ts = timestamps[idx]
                 ts_str = ts.strftime('%Y-%m-%d %H:%M')
-                
                 c_o = opens[idx]
                 c_h = highs[idx]
                 c_l = lows[idx]
                 c_c = closes[idx]
                 input_candles_str += f"[{k+1}] {ts_str} | O:{c_o:.0f} H:{c_h:.0f} L:{c_l:.0f} C:{c_c:.0f}<br>"
 
-            trade_ohlc_str = f"O:{trade_o:.0f} H:{trade_h:.0f} L:{trade_l:.0f} C:{trade_c:.0f}"
+            trade_ohlc_str = f"O:{entry_price:.0f} H:{highs[i+1]:.0f} L:{lows[i+1]:.0f} C:{exit_price:.0f}"
             
             results.append({
                 'timestamp': test_df.index[i+1],
@@ -259,62 +260,6 @@ def run_backtest(deriv_rules, norm_rules, test_df):
     }
     
     return pd.DataFrame(results), stats, dates, pnl_history
-
-def format_recent_data(df):
-    """
-    Extracts the last 100 rows and formats them into an HTML table
-    showing Raw (Binance), Normalized, and Derivative data.
-    """
-    recent = df.tail(100).copy()
-    
-    # Structure the HTML Manually for grouped headers
-    html = '<div style="height: 600px; overflow-y: scroll;">' # Added scroll container for large table
-    html += '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
-    html += '<thead class="thead-light" style="position: sticky; top: 0; z-index: 1;">'
-    html += '<tr>'
-    html += '<th rowspan="2" style="vertical-align: middle;">Timestamp (UTC)</th>'
-    html += '<th colspan="4">Raw Binance Data (USD)</th>'
-    html += '<th colspan="4">Normalized (Rounded)</th>'
-    html += '<th colspan="4">Derivative % (Rounded)</th>'
-    html += '</tr>'
-    html += '<tr>'
-    html += '<th>Open</th><th>High</th><th>Low</th><th>Close</th>'
-    html += '<th>O</th><th>H</th><th>L</th><th>C</th>'
-    html += '<th>O</th><th>H</th><th>L</th><th>C</th>'
-    html += '</tr>'
-    html += '</thead>'
-    html += '<tbody>'
-    
-    for index, row in recent.iterrows():
-        ts_str = index.strftime('%Y-%m-%d %H:%M')
-        
-        # Raw Data (2 decimals)
-        r_o = f"{row['open']:.2f}"
-        r_h = f"{row['high']:.2f}"
-        r_l = f"{row['low']:.2f}"
-        r_c = f"{row['close']:.2f}"
-        
-        # Normalized (4 decimals)
-        n_o = f"{row['n_open']:.4f}"
-        n_h = f"{row['n_high']:.4f}"
-        n_l = f"{row['n_low']:.4f}"
-        n_c = f"{row['n_close']:.4f}"
-        
-        # Derivative (4 decimals)
-        d_o = f"{row['d_open']:.4f}"
-        d_h = f"{row['d_high']:.4f}"
-        d_l = f"{row['d_low']:.4f}"
-        d_c = f"{row['d_close']:.4f}"
-        
-        html += f"<tr>"
-        html += f"<td>{ts_str}</td>"
-        html += f"<td>{r_o}</td><td>{r_h}</td><td>{r_l}</td><td>{r_c}</td>"
-        html += f"<td>{n_o}</td><td>{n_h}</td><td>{n_l}</td><td>{n_c}</td>"
-        html += f"<td>{d_o}</td><td>{d_h}</td><td>{d_l}</td><td>{d_c}</td>"
-        html += f"</tr>"
-        
-    html += '</tbody></table></div>'
-    return html
 
 def generate_charts(df, pnl_dates, pnl_history):
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
@@ -348,21 +293,74 @@ def generate_charts(df, pnl_dates, pnl_history):
     plt.close()
     return base64.b64encode(img.getvalue()).decode()
 
+def format_recent_data(df):
+    """
+    Shows last 100 rows in HTML table.
+    """
+    recent = df.tail(100).copy()
+    html = '<div style="height: 600px; overflow-y: scroll;">' 
+    html += '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
+    html += '<thead class="thead-light" style="position: sticky; top: 0; z-index: 1;">'
+    html += '<tr>'
+    html += '<th rowspan="2" style="vertical-align: middle;">Timestamp (UTC)</th>'
+    html += '<th colspan="4">Raw Binance Data (USD)</th>'
+    html += '<th colspan="4">Normalized (Rounded)</th>'
+    html += '<th colspan="4">Derivative % (Rounded)</th>'
+    html += '</tr>'
+    html += '<tr>'
+    html += '<th>Open</th><th>High</th><th>Low</th><th>Close</th>'
+    html += '<th>O</th><th>H</th><th>L</th><th>C</th>'
+    html += '<th>O</th><th>H</th><th>L</th><th>C</th>'
+    html += '</tr>'
+    html += '</thead>'
+    html += '<tbody>'
+    
+    for index, row in recent.iterrows():
+        ts_str = index.strftime('%Y-%m-%d %H:%M')
+        # Raw (2 decimals)
+        r_vals = f"<td>{row['open']:.2f}</td><td>{row['high']:.2f}</td><td>{row['low']:.2f}</td><td>{row['close']:.2f}</td>"
+        # Norm (4 decimals)
+        n_vals = f"<td>{row['n_open']:.4f}</td><td>{row['n_high']:.4f}</td><td>{row['n_low']:.4f}</td><td>{row['n_close']:.4f}</td>"
+        # Deriv (4 decimals)
+        d_vals = f"<td>{row['d_open']:.4f}</td><td>{row['d_high']:.4f}</td><td>{row['d_low']:.4f}</td><td>{row['d_close']:.4f}</td>"
+        
+        html += f"<tr><td>{ts_str}</td>{r_vals}{n_vals}{d_vals}</tr>"
+        
+    html += '</tbody></table></div>'
+    return html
+
 report_data = {}
 
 def main_logic():
-    df = fetch_data()
-    if df.empty: return
+    # 1. Fetch Raw
+    raw_df = fetch_data()
+    if raw_df.empty: 
+        print("Error: No data fetched.")
+        return
 
-    df = prepare_data(df)
+    # 2. Prepare Single Unified Dataframe (Raw + Norm + Deriv)
+    df = prepare_single_df(raw_df)
     
-    # --- Generate Recent Data Table ---
-    report_data['recent_data'] = format_recent_data(df)
+    # 3. PRINT First and Last 10 Entries as requested
+    print("\n" + "="*50)
+    print(" UNIFIED DATAFRAME: FIRST 10 ENTRIES ")
+    print("="*50)
+    # Select a subset of columns to make the print readable
+    cols_to_print = ['open', 'close', 'n_close', 'd_close']
+    print(df[cols_to_print].head(10))
     
+    print("\n" + "="*50)
+    print(" UNIFIED DATAFRAME: LAST 10 ENTRIES ")
+    print("="*50)
+    print(df[cols_to_print].tail(10))
+    print("="*50 + "\n")
+
+    # 4. Use this single DF for Prediction
     deriv_rules, norm_rules, test_df, top_seq = build_sequences_and_predict(df)
     results_df, stats, dates, pnl_curve = run_backtest(deriv_rules, norm_rules, test_df)
     
     plot_url = generate_charts(df, dates, pnl_curve)
+    report_data['recent_data'] = format_recent_data(df)
     
     formatted_seq = []
     for item in top_seq:
