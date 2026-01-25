@@ -159,17 +159,22 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
             if avg_return == 0: predicted_dir = 0
             
             # Outcome
+            # The window is [t-3, t-2, t-1, t]. 
+            # We predict at t-1 (entry).
+            # Outcome is at t.
             actual_ret = current_window[-1, 3] 
             actual_dir = 1 if actual_ret > 0 else -1
             if actual_ret == 0: actual_dir = 0
             
-            ts = pd.to_datetime(target_ts[i, -1])
+            # Use Entry Time (index -2) as the trade timestamp to align with inputs
+            ts = pd.to_datetime(target_ts[i, -2])
             
             # Prices
             entry_price = target_prices[i, -2]
             exit_price = target_prices[i, -1]
             
             # Input Sequence (timestamps and OHLC)
+            # Indices 0 to D-2 (inclusive)
             input_timestamps = pd.to_datetime(target_ts[i, :d-1]).strftime('%Y-%m-%d %H:%M:%S').tolist()
             input_candles = target_ohlc[i, :d-1].tolist()
 
@@ -219,9 +224,10 @@ def printaccuracy(predictions_df):
     plt.close()
     
     # --- HTML Generation ---
+    # Updated Headers to clarify Entry vs Exit
     table_html = """
     <table border="1">
-    <tr><th>Date</th><th>Pred</th><th>Entry</th><th>Exit</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th><th>Input Context</th></tr>
+    <tr><th>Entry Time</th><th>Pred</th><th>Entry Price</th><th>Exit Price</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th><th>Input Context (Last 3 Candles)</th></tr>
     """
     for _, row in active.tail(50).iterrows():
         p_str = "UP" if row['predicted_dir'] > 0 else "DOWN"
@@ -242,11 +248,9 @@ def printaccuracy(predictions_df):
     html_out = f"<h3>Accuracy: {accuracy:.2f}% ({correct}/{total})</h3><img src='data:image/png;base64,{plot_url}'/><br>{table_html}"
 
     # --- API Data Generation ---
-    # Convert timestamps to string for JSON serialization
     equity_curve = active[['timestamp', 'cum_pnl']].copy()
     equity_curve['timestamp'] = equity_curve['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
     
-    # Create full trade history for API
     trade_cols = ['timestamp', 'predicted_dir', 'entry_price', 'exit_price', 'actual_ret', 'is_correct', 'pnl', 'input_timestamps', 'input_candles']
     trade_history = active[trade_cols].copy()
     trade_history['timestamp'] = trade_history['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -315,14 +319,27 @@ def live_loop():
             if len(live_outcomes) > 0 and 'outcome' not in live_outcomes[-1]:
                 last_pred = live_outcomes[-1]
                 
+                # Check if we have the specific close required
+                # Last pred was made at df_live.iloc[-2] (conceptually)
+                # We need the close of the next candle
+                
                 if len(df_derived) >= 2:
-                    actual_close_ret = df_derived.iloc[-2]['close_ret']
-                    actual_dir = 1 if actual_close_ret > 0 else -1
-                    if actual_close_ret == 0: actual_dir = 0
+                    # Current last completed candle is -1
+                    # If this matches the prediction interval
                     
-                    exit_price = df_live.iloc[-2]['close']
+                    actual_close_ret = df_derived.iloc[-1]['close_ret'] # Most recent completed return
+                    
+                    # We need to verify if this is indeed the candle AFTER the entry
+                    # In live loop, we wake up after a candle closes.
+                    # df_live[-1] is the just-closed candle.
+                    
+                    exit_price = df_live.iloc[-1]['close']
                     entry_price = last_pred.get('entry_price', exit_price)
+                    
+                    # Simple PnL calc
                     raw_return = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
+                    actual_dir = 1 if raw_return > 0 else -1
+                    if raw_return == 0: actual_dir = 0
                     
                     if last_pred['pred_dir'] == 0:
                         last_pred['outcome'] = "Flat"
@@ -331,16 +348,33 @@ def live_loop():
                         last_pred['outcome'] = (last_pred['pred_dir'] == actual_dir)
                         last_pred['pnl'] = last_pred['pred_dir'] * raw_return
 
-                    last_pred['actual_ret'] = actual_close_ret
+                    last_pred['actual_ret'] = raw_return
                     last_pred['exit_price'] = exit_price
             
             # Step 2: Make NEW prediction
+            # We use the LAST D candles as the window. 
+            # D-1 candles are context. 
+            # We predict the NEXT candle (which hasn't happened yet).
+            # Wait, the model predicts the *last* component of a sequence of D.
+            # So we supply D-1 inputs, and predict D.
+            
             if len(df_derived) >= D:
-                recent_context = df_derived.iloc[-D:-1][['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
+                # We want to predict the candle starting NOW.
+                # So we take the last D-1 completed candles as context.
+                
+                # df_derived includes returns for the just-closed candle at index -1.
+                # So context is df_derived.iloc[-(D-1):]
+                
+                context_slice = df_derived.iloc[-(D-1):]
+                recent_context = context_slice[['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
                 recent_context_flat = recent_context.reshape(-1)
                 
-                # Extract input sequence info
-                input_rows = df_live.iloc[-D:-1]
+                # Extract input sequence info (Raw OHLC)
+                # These are the candles corresponding to the returns in context_slice
+                # context_slice indices match df_live indices (if aligned).
+                # deriveround drops index 0.
+                
+                input_rows = df_live.loc[context_slice.index]
                 input_timestamps = input_rows['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
                 input_candles = input_rows[['open', 'high', 'low', 'close']].values.tolist()
                 
@@ -350,7 +384,8 @@ def live_loop():
                 diff = np.abs(model_context_flat - recent_context_flat)
                 matches_idx = np.where(np.all(diff < E, axis=1))[0]
                 
-                entry_price = df_live.iloc[-2]['close']
+                # Entry price is the close of the last completed candle
+                entry_price = df_live.iloc[-1]['close']
                 
                 if len(matches_idx) > 0:
                     model_outcomes = model_sequences[matches_idx, -1, :]
@@ -382,6 +417,8 @@ def live_loop():
                 
         except Exception as e:
             print(f"Live loop error: {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(60)
 
 # --- Web Server & API ---
