@@ -389,8 +389,8 @@ def dashboard():
         
         <h3>Recent Performance (14d)</h3>
         <table>
-            <tr><th>Time</th><th>Pred</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>
-             {''.join([f"<tr><td>{r['timestamp']}</td><td>{r['prediction']}</td><td>{r['entry']}</td><td>{r['exit']}</td><td class='{r['outcome'].lower()}'>{r['outcome']}</td><td>{r['pnl']:.4f}</td></tr>" for r in reversed(recent_perf_results)])}
+            <tr><th>Time</th><th>Pred</th><th>Input Candles (O, C)</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>
+             {''.join([f"<tr><td>{r['timestamp']}</td><td>{r['prediction']}</td><td><div class='code-block'>{r['input_candles']}</div></td><td>{r['entry']}</td><td>{r['exit']}</td><td class='{r['outcome'].lower()}'>{r['outcome']}</td><td>{r['pnl']:.4f}</td></tr>" for r in reversed(recent_perf_results)])}
         </table>
     </body>
     </html>
