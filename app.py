@@ -18,20 +18,30 @@ SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
 LIMIT = 2000
 THRESHOLD = 0.001
-# Radius acts as the "size" of your fading sphere. 
-# Since we normalize data, 2.0 is a generous overlap size (2 standard deviations).
 SPHERE_RADIUS = 2.0 
 PORT = 8080
 
 app = Flask(__name__)
 
-# --- Custom Fading Sphere Logic ---
-# This function defines your exact "painting" math: 
-# Intensity = 1 at center, 0 at edge.
+# --- Custom Fading Sphere Logic (Fixed) ---
 def fading_sphere_kernel(distances):
-    # distances is an array of distances from the test point to neighbors
-    # We clip to ensure no negative values, though radius search prevents this usually
-    weights = np.maximum(0, 1 - (distances / SPHERE_RADIUS))
+    """
+    Handles the jagged array structure returned by RadiusNeighbors.
+    Input: Array of arrays (one sub-array of distances per query point).
+    Output: Array of arrays (one sub-array of weights per query point).
+    """
+    # Create an empty object array of the same length
+    weights = np.empty(len(distances), dtype=object)
+    
+    # Iterate because we cannot vectorize over a jagged object array
+    for i, d in enumerate(distances):
+        # Apply the sphere logic: 1 at center (d=0), 0 at edge (d=radius)
+        if len(d) > 0:
+            w = np.maximum(0.0, 1.0 - (d / SPHERE_RADIUS))
+            weights[i] = w
+        else:
+            weights[i] = np.array([])
+            
     return weights
 
 # --- 1. Fetch Data ---
@@ -78,13 +88,10 @@ def prepare_data(df):
 def train_painting(X_train, y_train):
     print("Painting the canvas (Building Spatial Tree)...")
     
-    # We use a RadiusNeighborsClassifier.
-    # This spatially indexes the points. It is the "efficient" way to store the painting.
-    # weights=fading_sphere_kernel applies your specific 1 -> 0 fading logic.
     clf = RadiusNeighborsClassifier(radius=SPHERE_RADIUS, 
                                     weights=fading_sphere_kernel, 
                                     algorithm='auto', 
-                                    outlier_label=0) # If no spheres touch, assume 0 (Flat)
+                                    outlier_label=0)
     
     clf.fit(X_train, y_train)
     return clf
@@ -107,28 +114,39 @@ def create_plots(y_true, y_pred, returns):
     
     # Confusion Matrix
     from sklearn.metrics import confusion_matrix
-    cm = confusion_matrix(y_true, y_pred, labels=[-1, 0, 1])
-    fig2, ax2 = plt.subplots(figsize=(5, 5))
-    ax2.imshow(cm, cmap='Blues')
-    ax2.set_title('Confusion Matrix')
-    
-    # Annotate
-    for i in range(3):
-        for j in range(3):
-            ax2.text(j, i, cm[i, j], ha='center', va='center', 
-                     color='white' if cm[i,j] > cm.max()/2 else 'black')
-    
-    buf2 = io.BytesIO()
-    fig2.savefig(buf2, format='png', bbox_inches='tight')
-    plot_cm = base64.b64encode(buf2.getvalue()).decode()
-    plt.close(fig2)
-    
+    try:
+        cm = confusion_matrix(y_true, y_pred, labels=[-1, 0, 1])
+        fig2, ax2 = plt.subplots(figsize=(5, 5))
+        ax2.imshow(cm, cmap='Blues')
+        ax2.set_title('Confusion Matrix')
+        
+        for i in range(3):
+            for j in range(3):
+                ax2.text(j, i, cm[i, j], ha='center', va='center', 
+                         color='white' if cm[i,j] > cm.max()/2 else 'black')
+        
+        buf2 = io.BytesIO()
+        fig2.savefig(buf2, format='png', bbox_inches='tight')
+        plot_cm = base64.b64encode(buf2.getvalue()).decode()
+        plt.close(fig2)
+    except:
+        plot_cm = ""
+
     return plot_pnl, plot_cm
 
 # --- Main Logic ---
 RESULTS = {}
 
 def update_system():
+    # Clear old broken models if they exist
+    try:
+        # We test-load. If it fails (due to old broken kernel ref), we delete.
+        if os.path.exists(MODEL_PATH):
+            joblib.load(MODEL_PATH)
+    except Exception:
+        print("Detected broken model file. Removing...")
+        os.remove(MODEL_PATH)
+
     # 1. Get Data
     df = get_ohlc_data()
     X, y, y_raw = prepare_data(df)
@@ -139,8 +157,7 @@ def update_system():
     y_train, y_test = y[:split], y[split:]
     y_raw_test = y_raw[split:]
     
-    # 3. Normalize (Crucial for sphere geometry)
-    # We save the scaler stats to apply to test data
+    # 3. Normalize
     mean = X_train.mean(axis=0)
     std = X_train.std(axis=0) + 1e-8
     
@@ -156,9 +173,8 @@ def update_system():
         print("Saving painting to disk...")
         joblib.dump(clf, MODEL_PATH)
         
-    # 5. Inference (Fast Lookup)
+    # 5. Inference
     print("Looking up test points in the painting...")
-    # This is O(N_test * log(N_train)) - much faster than brute force
     preds = clf.predict(X_test_norm)
     
     # 6. Stats
@@ -174,7 +190,6 @@ def update_system():
     RESULTS['plot_pnl'] = plot_pnl
     RESULTS['plot_cm'] = plot_cm
     
-    # Table data
     df_res = pd.DataFrame({
         'Pred': preds,
         'Actual': y_test,
@@ -190,9 +205,9 @@ HTML = """
     <div style="background:#222; padding:1rem; border-radius:8px; margin-bottom:1rem">
         Accuracy: <b>{{ r.acc }}%</b> | PnL: <b>{{ r.pnl }}%</b> | Samples: {{ r.count }}
     </div>
-    <div style="display:flex; gap:1rem">
-        <img src="data:image/png;base64,{{ r.plot_pnl }}" style="border-radius:8px">
-        <img src="data:image/png;base64,{{ r.plot_cm }}" style="border-radius:8px">
+    <div style="display:flex; gap:1rem; flex-wrap:wrap">
+        <img src="data:image/png;base64,{{ r.plot_pnl }}" style="border-radius:8px; background:#222">
+        <img src="data:image/png;base64,{{ r.plot_cm }}" style="border-radius:8px; background:#fff">
     </div>
     <h3>Recent Vectors</h3>
     <style>table{width:100%; border-collapse:collapse} td,th{padding:8px; border-bottom:1px solid #444}</style>
