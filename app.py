@@ -123,14 +123,18 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
     """Predicts on df_target using the top patterns."""
     print("Running predictions...")
     data_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
+    ohlc_cols = ['open', 'high', 'low', 'close']
+    
     target_values = df_target[data_cols].values
     timestamps = df_target['timestamp'].values
+    ohlc_values = df_target[ohlc_cols].values
     
     # Extract raw close prices for entry/exit logging
     close_prices = df_target['close'].values
     
     target_windows = np.lib.stride_tricks.sliding_window_view(target_values, window_shape=d, axis=0)
     target_ts = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=d, axis=0)
+    target_ohlc = np.lib.stride_tricks.sliding_window_view(ohlc_values, window_shape=d, axis=0)
     target_prices = np.lib.stride_tricks.sliding_window_view(close_prices, window_shape=d, axis=0)
     
     predictions = []
@@ -162,11 +166,13 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
             ts = pd.to_datetime(target_ts[i, -1])
             
             # Prices
-            # Entry: Close of the candle BEFORE the outcome (index -2)
-            # Exit: Close of the outcome candle (index -1)
             entry_price = target_prices[i, -2]
             exit_price = target_prices[i, -1]
             
+            # Input Sequence (timestamps and OHLC)
+            input_timestamps = pd.to_datetime(target_ts[i, :d-1]).strftime('%Y-%m-%d %H:%M:%S').tolist()
+            input_candles = target_ohlc[i, :d-1].tolist()
+
             predictions.append({
                 'timestamp': ts,
                 'predicted_dir': predicted_dir,
@@ -174,7 +180,9 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
                 'actual_dir': actual_dir,
                 'is_correct': (predicted_dir == actual_dir) and (predicted_dir != 0),
                 'entry_price': entry_price,
-                'exit_price': exit_price
+                'exit_price': exit_price,
+                'input_timestamps': input_timestamps,
+                'input_candles': input_candles
             })
             
     return pd.DataFrame(predictions)
@@ -229,7 +237,8 @@ def printaccuracy(predictions_df):
     equity_curve['timestamp'] = equity_curve['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
     
     # Create full trade history for API
-    trade_history = active[['timestamp', 'predicted_dir', 'entry_price', 'exit_price', 'actual_ret', 'is_correct', 'pnl']].copy()
+    trade_cols = ['timestamp', 'predicted_dir', 'entry_price', 'exit_price', 'actual_ret', 'is_correct', 'pnl', 'input_timestamps', 'input_candles']
+    trade_history = active[trade_cols].copy()
     trade_history['timestamp'] = trade_history['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
     
     stats_data = {
@@ -320,6 +329,11 @@ def live_loop():
                 recent_context = df_derived.iloc[-D:-1][['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
                 recent_context_flat = recent_context.reshape(-1)
                 
+                # Extract input sequence info
+                input_rows = df_live.iloc[-D:-1]
+                input_timestamps = input_rows['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
+                input_candles = input_rows[['open', 'high', 'low', 'close']].values.tolist()
+                
                 model_context = model_sequences[:, :D-1, :]
                 model_context_flat = model_context.reshape(model_context.shape[0], -1)
                 
@@ -338,7 +352,9 @@ def live_loop():
                         'time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
                         'pred_dir': pred_dir,
                         'matches': int(len(matches_idx)), # ensure int for JSON
-                        'entry_price': entry_price
+                        'entry_price': entry_price,
+                        'input_timestamps': input_timestamps,
+                        'input_candles': input_candles
                     })
                 else:
                     live_outcomes.append({
@@ -346,7 +362,9 @@ def live_loop():
                         'pred_dir': 0,
                         'matches': 0,
                         'note': 'No Match',
-                        'entry_price': entry_price
+                        'entry_price': entry_price,
+                        'input_timestamps': input_timestamps,
+                        'input_candles': input_candles
                     })
             
             if len(live_outcomes) > 336:
