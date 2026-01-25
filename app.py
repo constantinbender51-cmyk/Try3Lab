@@ -20,7 +20,7 @@ A_PARAM = 0  # Deprecated (rounding removed)
 B_SPLIT = 0.70  # 70% Training
 C_TOP = 0.20  # Top 20% frequent sequences
 D_LEN = 4  # Full sequence length (3 previous + 1 target)
-E_SIM = 0.01  # 0.5% similarity threshold
+E_SIM = 0.1  # 0.5% similarity threshold
 API_PORT = 8080
 
 # Global storage for live data and results
