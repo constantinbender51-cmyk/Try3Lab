@@ -238,12 +238,16 @@ def run_backtest(deriv_rules, norm_rules, test_df):
             input_candles_str = ""
             for k in range(SEQ_LEN):
                 idx = i - SEQ_LEN + 1 + k
-                # Fetch raw OHLC values
+                # Fetch timestamp and raw OHLC values
+                ts = timestamps[idx]
+                ts_str = ts.strftime('%Y-%m-%d %H:%M')
+                
                 c_o = opens[idx]
                 c_h = highs[idx]
                 c_l = lows[idx]
                 c_c = closes[idx]
-                input_candles_str += f"[{k+1}] O:{c_o:.0f} H:{c_h:.0f} L:{c_l:.0f} C:{c_c:.0f}<br>"
+                # Added timestamp to the string
+                input_candles_str += f"[{k+1}] {ts_str} | O:{c_o:.0f} H:{c_h:.0f} L:{c_l:.0f} C:{c_c:.0f}<br>"
 
             trade_ohlc_str = f"O:{trade_o:.0f} H:{trade_h:.0f} L:{trade_l:.0f} C:{trade_c:.0f}"
             
