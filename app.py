@@ -262,14 +262,15 @@ def run_backtest(deriv_rules, norm_rules, test_df):
 
 def format_recent_data(df):
     """
-    Extracts the last 10 rows and formats them into an HTML table
+    Extracts the last 100 rows and formats them into an HTML table
     showing Raw (Binance), Normalized, and Derivative data.
     """
-    recent = df.tail(10).copy()
+    recent = df.tail(100).copy()
     
     # Structure the HTML Manually for grouped headers
-    html = '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
-    html += '<thead class="thead-light">'
+    html = '<div style="height: 600px; overflow-y: scroll;">' # Added scroll container for large table
+    html += '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
+    html += '<thead class="thead-light" style="position: sticky; top: 0; z-index: 1;">'
     html += '<tr>'
     html += '<th rowspan="2" style="vertical-align: middle;">Timestamp (UTC)</th>'
     html += '<th colspan="4">Raw Binance Data (USD)</th>'
@@ -312,7 +313,7 @@ def format_recent_data(df):
         html += f"<td>{d_o}</td><td>{d_h}</td><td>{d_l}</td><td>{d_c}</td>"
         html += f"</tr>"
         
-    html += '</tbody></table>'
+    html += '</tbody></table></div>'
     return html
 
 def generate_charts(df, pnl_dates, pnl_history):
@@ -413,7 +414,7 @@ def home():
         
         <div class="row">
             <div class="col-md-12">
-                <h3>Data Inspection (Last 10 Candles)</h3>
+                <h3>Data Inspection (Last 100 Candles)</h3>
                 <p>Verify these exact raw candles against your Binance chart (UTC time).</p>
                 {report_data.get('recent_data', '')}
             </div>
