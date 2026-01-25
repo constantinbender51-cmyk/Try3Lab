@@ -2,313 +2,265 @@ import os
 import ccxt
 import pandas as pd
 import numpy as np
-import joblib
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg') # Non-interactive backend for server environment
 import matplotlib.pyplot as plt
 import io
 import base64
-import time
 from flask import Flask, render_template_string
-from sklearn.neighbors import RadiusNeighborsClassifier
 
-# --- Configuration ---
-DATA_PATH = '/app/data/ohlc_full.csv'
-MODEL_PATH = '/app/data/painting_model_full.pkl'
-SYMBOL = 'BTC/USDT'
+# Configuration
+DATA_DIR = '/app/data'
+DATA_FILE = os.path.join(DATA_DIR, 'ohlc.csv')
+SYMBOL = 'ETH/USDT'
 TIMEFRAME = '1h'
-TOTAL_CANDLES = 10000  # "Remove sample limitations" - fetched via pagination
-THRESHOLD = 0.001
-SPHERE_RADIUS = 2.0 
+SEQ_LEN = 3
+ROUNDING = 3  # 0.1% is 0.001, so 3 decimal places
+THRESHOLD = 0.005 # 0.5%
 PORT = 8080
 
 app = Flask(__name__)
 
-# --- Custom Fading Sphere Logic ---
-def fading_sphere_kernel(distances):
-    weights = np.empty(len(distances), dtype=object)
-    for i, d in enumerate(distances):
-        if len(d) > 0:
-            weights[i] = np.maximum(0.0, 1.0 - (d / SPHERE_RADIUS))
-        else:
-            weights[i] = np.array([])
-    return weights
+def ensure_dir(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
 
-# --- 1. Fetch Data (Pagination Enabled) ---
-def get_ohlc_data():
-    os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
+def fetch_data():
+    ensure_dir(DATA_DIR)
     
-    # If file exists and is large enough, load it
-    if os.path.exists(DATA_PATH):
-        df = pd.read_csv(DATA_PATH)
-        if len(df) >= TOTAL_CANDLES * 0.9:
-            print(f"Loading {len(df)} candles from disk...")
-            return df
-    
-    print(f"Fetching ~{TOTAL_CANDLES} candles from Binance...")
-    exchange = ccxt.binance()
-    
-    # Calculate start time for 10,000 hours ago
-    since = exchange.milliseconds() - (TOTAL_CANDLES * 60 * 60 * 1000)
-    all_ohlc = []
-    
-    while len(all_ohlc) < TOTAL_CANDLES:
-        try:
-            ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
-            if not ohlc:
-                break
-            since = ohlc[-1][0] + 1  # Move to next ms
-            all_ohlc += ohlc
-            print(f"Fetched {len(all_ohlc)} candles...")
-            time.sleep(0.1) # Respect rate limits
-        except Exception as e:
-            print(f"Fetch error: {e}")
-            break
-            
-    df = pd.DataFrame(all_ohlc, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df.drop_duplicates(subset=['timestamp'], inplace=True)
-    df.to_csv(DATA_PATH, index=False)
+    if os.path.exists(DATA_FILE):
+        print("Loading data from disk...")
+        df = pd.read_csv(DATA_FILE, index_col=0, parse_dates=True)
+    else:
+        print("Fetching data from Binance...")
+        exchange = ccxt.binance()
+        # Fetching approx 1000 candles (default)
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df.to_csv(DATA_FILE)
     return df
 
-# --- 2. Process & Feature Engineering ---
 def prepare_data(df):
-    raw_ohlc = df[['open', 'high', 'low', 'close']].values
-    # Derivative OHLC (first entry 0)
-    derivative = np.diff(raw_ohlc, axis=0, prepend=0)
+    # 3. Create derivative version (price_i - price_i-1) / price_i-1
+    # We apply this to Open, High, Low, Close
+    # Since we can't do it for the first row, we fill with 0
+    deriv_cols = ['d_open', 'd_high', 'd_low', 'd_close']
+    for col in ['open', 'high', 'low', 'close']:
+        df[f'd_{col}'] = df[col].pct_change().fillna(0)
+
+    # 5. Divide raw ohlc by first candle (e.g. open / first open)
+    # We normalize each column by the very first value of that column in the dataset
+    first_vals = df.iloc[0]
+    norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
+    for col, n_col in zip(['open', 'high', 'low', 'close'], norm_cols):
+        df[n_col] = df[col] / first_vals[col]
+
+    # 6. Round raw ohlc (normalized) and derivative version to 0.1% (3 decimal places)
+    # Note: 0.1% = 0.001
+    cols_to_round = deriv_cols + norm_cols
+    df[cols_to_round] = df[cols_to_round].round(ROUNDING)
+
+    return df
+
+def build_sequences_and_predict(df):
+    # Split Train/Test (80/20)
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
+
+    # 7. Count outcome of every sequence
+    # Pattern logic: We will use the DERIVATIVE columns of the 'close' price for the sequence pattern.
+    # Using normalized raw prices for pattern matching is usually ineffective as price levels shift.
+    pattern_map = {}
+
+    # Build Training Dictionary
+    # We iterate through the training data to build the "Knowledge Base"
+    # Sequence is based on the 'd_close' of previous 3 candles
+    values = train_df['d_close'].values
     
-    X = []
-    y = []
-    y_raw_return = []
-    input_verification = [] # Store raw close prices for verification
+    # We need to look ahead to determine outcome
+    # Outcome is based on the NEXT candle (open to close change) relative to threshold
+    # However, prompt asks for next CLOSE rises/falls/stays. 
+    # Usually this is (Close_next - Close_current) / Close_current
     
-    seq_len = 3
+    # Pre-calculate next return for labeling
+    # We use unrounded values for accurate labeling, but grouped by rounded sequences
+    train_outcomes = (train_df['close'].shift(-1) - train_df['close']) / train_df['close']
     
-    # Create 12D points
-    for i in range(len(derivative) - seq_len):
-        # Feature: 12 dims
-        X.append(derivative[i:i+seq_len].flatten())
+    print("Training model...")
+    for i in range(SEQ_LEN, len(train_df) - 1):
+        # Sequence: last 3 derivative closes
+        seq = tuple(values[i-SEQ_LEN+1:i+1]) # Tuple is hashable
         
-        # Verification Data: The Raw Close prices of the 3 candles in sequence
-        # Indices: i, i+1, i+2
-        closes = df['close'].values[i:i+seq_len]
-        input_verification.append(closes)
+        outcome_val = train_outcomes.iloc[i]
         
-        # Target: 4th candle direction (Index i+3 relative to start, or i+seq_len)
-        # We predict movement from end of sequence (i+seq_len-1) to next (i+seq_len)
-        curr_price = df['close'].values[i+seq_len-1]
-        next_price = df['close'].values[i+seq_len]
-        
-        change = (next_price - curr_price) / curr_price
-        y_raw_return.append(change)
-        
-        if change > THRESHOLD: y.append(1.0)
-        elif change < -THRESHOLD: y.append(-1.0)
-        else: y.append(0.0)
+        if outcome_val > THRESHOLD:
+            label = 'LONG'
+        elif outcome_val < -THRESHOLD:
+            label = 'SHORT'
+        else:
+            label = 'FLAT'
             
-    return np.array(X), np.array(y), np.array(y_raw_return), np.array(input_verification)
-
-# --- 3. Training ---
-def train_painting(X_train, y_train):
-    print("Painting the canvas (Building Spatial Tree)...")
-    clf = RadiusNeighborsClassifier(radius=SPHERE_RADIUS, 
-                                    weights=fading_sphere_kernel, 
-                                    algorithm='auto', 
-                                    outlier_label=0)
-    clf.fit(X_train, y_train)
-    return clf
-
-# --- 4. Plotting ---
-def create_plots(y_true, y_pred, returns):
-    # Plot 1: Cumulative PnL (Full History)
-    fig1, ax1 = plt.subplots(figsize=(12, 6))
-    cumulative_returns = np.cumsum(returns) * 100
-    
-    # Create a gradient-like fill or just a clean line
-    ax1.plot(cumulative_returns, color='#00ff88', linewidth=1.5, label='Strategy')
-    ax1.fill_between(range(len(cumulative_returns)), cumulative_returns, 0, color='#00ff88', alpha=0.1)
-    
-    # Add a baseline (Hold)
-    # ax1.plot(np.cumsum(y_raw_test) * 100, color='gray', alpha=0.5, label='Buy & Hold')
-    
-    ax1.set_facecolor('#1e1e1e')
-    fig1.patch.set_facecolor('#1e1e1e')
-    ax1.tick_params(colors='white')
-    ax1.set_title(f'Strategy PnL over {len(returns)} Trades', color='white', fontsize=14)
-    ax1.set_ylabel('Return (%)', color='white')
-    ax1.set_xlabel('Trade Sequence #', color='white')
-    ax1.grid(True, alpha=0.1)
-    ax1.legend()
-    
-    buf1 = io.BytesIO()
-    fig1.savefig(buf1, format='png', bbox_inches='tight')
-    plot_pnl = base64.b64encode(buf1.getvalue()).decode()
-    plt.close(fig1)
-    
-    # Plot 2: Confusion Matrix
-    from sklearn.metrics import confusion_matrix
-    try:
-        cm = confusion_matrix(y_true, y_pred, labels=[-1, 0, 1])
-        fig2, ax2 = plt.subplots(figsize=(5, 5))
-        ax2.imshow(cm, cmap='Blues')
-        ax2.set_title('Confusion Matrix')
-        ax2.set_xticklabels(['Short', 'Flat', 'Long'])
-        ax2.set_yticklabels(['Short', 'Flat', 'Long'])
+        if seq not in pattern_map:
+            pattern_map[seq] = {'LONG': 0, 'SHORT': 0, 'FLAT': 0}
         
-        for i in range(3):
-            for j in range(3):
-                ax2.text(j, i, cm[i, j], ha='center', va='center', 
-                         color='white' if cm[i,j] > cm.max()/2 else 'black')
+        pattern_map[seq][label] += 1
+
+    # Convert counts to probabilities/predictions
+    # We pick the outcome with the highest count
+    prediction_rules = {}
+    for seq, counts in pattern_map.items():
+        best_outcome = max(counts, key=counts.get)
+        # Only predict if there's a clear winner (optional, but good for stability)
+        prediction_rules[seq] = best_outcome
+
+    return prediction_rules, test_df
+
+def run_backtest(prediction_rules, test_df):
+    results = []
+    
+    values = test_df['d_close'].values
+    opens = test_df['open'].values
+    closes = test_df['close'].values
+    
+    # 8. Take test sequences and predict outcome
+    # 9. Test accurate, pnl
+    
+    cumulative_pnl = 0.0
+    wins = 0
+    total_trades = 0
+    
+    # PnL History for plotting
+    pnl_history = [0]
+    dates = [test_df.index[0]]
+
+    print("Running backtest...")
+    # Iterate test data
+    for i in range(SEQ_LEN, len(test_df) - 1):
+        seq = tuple(values[i-SEQ_LEN+1:i+1])
         
-        buf2 = io.BytesIO()
-        fig2.savefig(buf2, format='png', bbox_inches='tight')
-        plot_cm = base64.b64encode(buf2.getvalue()).decode()
-        plt.close(fig2)
-    except:
-        plot_cm = ""
-
-    return plot_pnl, plot_cm
-
-# --- Main Logic ---
-RESULTS = {}
-
-def update_system():
-    # Cleanup old models
-    if os.path.exists(MODEL_PATH):
-        try:
-            joblib.load(MODEL_PATH)
-        except:
-            os.remove(MODEL_PATH)
-
-    # 1. Get Data
-    df = get_ohlc_data()
-    X, y, y_raw, inputs = prepare_data(df)
-    
-    # 2. Split (70/30)
-    split = int(len(X) * 0.7)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
-    y_raw_test = y_raw[split:]
-    inputs_test = inputs[split:]
-    
-    # 3. Normalize
-    mean = X_train.mean(axis=0)
-    std = X_train.std(axis=0) + 1e-8
-    X_train_norm = (X_train - mean) / std
-    X_test_norm = (X_test - mean) / std
-    
-    # 4. Load/Train
-    if os.path.exists(MODEL_PATH):
-        print("Loading painting...")
-        clf = joblib.load(MODEL_PATH)
-    else:
-        clf = train_painting(X_train_norm, y_train)
-        print("Saving painting...")
-        joblib.dump(clf, MODEL_PATH)
+        pred = prediction_rules.get(seq, 'FLAT') # Default to FLAT if unseen
         
-    # 5. Inference
-    print(f"Inference on {len(X_test)} points...")
-    preds = clf.predict(X_test_norm)
-    
-    # 6. Stats & Assets
-    acc = np.mean(preds == y_test) * 100
-    strat_returns = preds * y_raw_test
-    total_pnl = np.sum(strat_returns) * 100
-    
-    plot_pnl, plot_cm = create_plots(y_test, preds, strat_returns)
-    
-    # 7. Create Verification Table
-    # We combine Inputs (Candle 1, 2, 3) with Prediction and Result
-    df_res = pd.DataFrame({
-        'C1': inputs_test[:, 0],
-        'C2': inputs_test[:, 1],
-        'C3': inputs_test[:, 2],
-        'Pred_Dir': preds,
-        'Actual_Dir': y_test,
-        'Actual_Ret': y_raw_test,
-        'Strat_PnL': strat_returns
-    })
-    
-    RESULTS['acc'] = f"{acc:.2f}"
-    RESULTS['pnl'] = f"{total_pnl:.2f}"
-    RESULTS['count'] = len(X_test)
-    RESULTS['plot_pnl'] = plot_pnl
-    RESULTS['plot_cm'] = plot_cm
-    # Showing last 20 rows
-    RESULTS['table'] = df_res.tail(20).to_html(classes='table', index=False, float_format='%.2f')
-
-# --- Web Server ---
-HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>13D Sphere Strategy</title>
-    <style>
-        body { background-color: #121212; color: #e0e0e0; font-family: 'Segoe UI', monospace; padding: 20px; margin: 0; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        h1 { color: #00ff88; text-transform: uppercase; letter-spacing: 2px; border-bottom: 1px solid #333; padding-bottom: 10px; }
-        .metrics { display: flex; gap: 20px; margin-bottom: 20px; }
-        .metric-box { background: #1e1e1e; padding: 15px; border-radius: 5px; flex: 1; text-align: center; border: 1px solid #333; }
-        .metric-val { font-size: 1.5em; font-weight: bold; color: #fff; }
-        .metric-lbl { color: #888; font-size: 0.9em; }
-        .charts { display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 30px; }
-        .chart-main { flex: 2; min-width: 300px; }
-        .chart-sub { flex: 1; min-width: 300px; display: flex; align-items: center; justify-content: center; background: #1e1e1e; border-radius: 5px; }
-        img { max-width: 100%; height: auto; border-radius: 5px; }
-        table { width: 100%; border-collapse: collapse; background: #1e1e1e; font-size: 0.9em; }
-        th { text-align: left; padding: 12px; background: #252525; color: #00ff88; }
-        td { padding: 10px; border-bottom: 1px solid #333; }
-        tr:hover { background: #2a2a2a; }
-        .pos { color: #00ff88; }
-        .neg { color: #ff4444; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>13-Dimensional Sphere Inference</h1>
+        # Calculate actual PnL for the next candle
+        # Prompt: "If we predict long we calculate pnl by (close-open)/open"
+        # This implies we enter at Open of next candle and exit at Close of next candle
         
-        <div class="metrics">
-            <div class="metric-box">
-                <div class="metric-val">{{ r.acc }}%</div>
-                <div class="metric-lbl">Accuracy</div>
-            </div>
-            <div class="metric-box">
-                <div class="metric-val" style="color: {{ 'red' if r.pnl.startswith('-') else '#00ff88' }}">{{ r.pnl }}%</div>
-                <div class="metric-lbl">Total PnL</div>
-            </div>
-            <div class="metric-box">
-                <div class="metric-val">{{ r.count }}</div>
-                <div class="metric-lbl">Test Samples</div>
-            </div>
-        </div>
+        entry_price = opens[i+1]
+        exit_price = closes[i+1]
+        
+        trade_pnl = 0.0
+        
+        if pred == 'LONG':
+            trade_pnl = (exit_price - entry_price) / entry_price
+        elif pred == 'SHORT':
+            trade_pnl = -(exit_price - entry_price) / entry_price
+        
+        # Check accuracy (Directional)
+        actual_move = (exit_price - entry_price) / entry_price
+        is_correct = False
+        
+        if pred == 'LONG' and actual_move > THRESHOLD: is_correct = True
+        elif pred == 'SHORT' and actual_move < -THRESHOLD: is_correct = True
+        elif pred == 'FLAT' and abs(actual_move) <= THRESHOLD: is_correct = True
+        
+        if pred != 'FLAT':
+            cumulative_pnl += trade_pnl
+            total_trades += 1
+            if trade_pnl > 0:
+                wins += 1
+            
+            pnl_history.append(cumulative_pnl)
+            dates.append(test_df.index[i+1])
+            
+            results.append({
+                'timestamp': test_df.index[i+1],
+                'sequence': str(seq),
+                'prediction': pred,
+                'actual_move_pct': round(actual_move * 100, 2),
+                'pnl': round(trade_pnl * 100, 2),
+                'cum_pnl': round(cumulative_pnl * 100, 2)
+            })
 
-        <div class="charts">
-            <div class="chart-main">
-                <img src="data:image/png;base64,{{ r.plot_pnl }}">
-            </div>
-            <div class="chart-sub">
-                <img src="data:image/png;base64,{{ r.plot_cm }}">
-            </div>
-        </div>
+    stats = {
+        'total_trades': total_trades,
+        'win_rate': round((wins / total_trades * 100), 2) if total_trades > 0 else 0,
+        'final_pnl_pct': round(cumulative_pnl * 100, 2)
+    }
+    
+    return pd.DataFrame(results), stats, dates, pnl_history
 
-        <h3>Verification: Recent Input Sequences & Predictions</h3>
-        <p style="color:#888; font-size:0.8em">C1, C2, C3 are the raw closing prices of the input sequence. Pred_Dir is the strategy's guess (1=Up, -1=Down, 0=Flat).</p>
-        <div style="overflow-x: auto;">
-            {{ r.table|safe }}
-        </div>
-    </div>
-</body>
-</html>
-"""
+def generate_plot(dates, pnl_history):
+    plt.figure(figsize=(10, 5))
+    plt.plot(dates, pnl_history, label='Strategy PnL (Cumulative %)')
+    plt.title(f'Backtest Results: ETH/USDT ({TIMEFRAME})')
+    plt.ylabel('PnL')
+    plt.xlabel('Date')
+    plt.legend()
+    plt.grid(True)
+    
+    img = io.BytesIO()
+    plt.savefig(img, format='png')
+    img.seek(0)
+    return base64.b64encode(img.getvalue()).decode()
+
+# Global storage for server
+report_data = {}
+
+def main_logic():
+    df = fetch_data()
+    df = prepare_data(df)
+    rules, test_df = build_sequences_and_predict(df)
+    results_df, stats, dates, pnl_curve = run_backtest(rules, test_df)
+    
+    plot_url = generate_plot(dates, pnl_curve)
+    
+    # Store for Flask
+    report_data['stats'] = stats
+    report_data['plot'] = plot_url
+    report_data['table'] = results_df.tail(20).to_html(classes='table table-striped', index=False)
 
 @app.route('/')
 def home():
-    if not RESULTS:
-        return "<body style='background:#121212;color:white'><h1>System Initializing...</h1><p>Fetching 10k candles and painting dimensions. Please refresh in 30 seconds.</p></body>"
-    return render_template_string(HTML, r=RESULTS)
+    if not report_data:
+        return "Processing data... please refresh in a moment."
+    
+    html = f"""
+    <html>
+    <head>
+        <title>Crypto Prediction Bot</title>
+        <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
+        <style>body{{ padding: 20px; }}</style>
+    </head>
+    <body>
+        <h1>ETH/USDT 1H Prediction Results</h1>
+        <hr>
+        <div class="row">
+            <div class="col-md-4">
+                <h3>Performance Stats</h3>
+                <ul class="list-group">
+                    <li class="list-group-item">Total Trades: {report_data['stats']['total_trades']}</li>
+                    <li class="list-group-item">Win Rate: {report_data['stats']['win_rate']}%</li>
+                    <li class="list-group-item">Final PnL: {report_data['stats']['final_pnl_pct']}%</li>
+                </ul>
+            </div>
+            <div class="col-md-8">
+                <img src="data:image/png;base64,{report_data['plot']}" style="width:100%">
+            </div>
+        </div>
+        <hr>
+        <h3>Recent Test Trades (Last 20)</h3>
+        {report_data['table']}
+    </body>
+    </html>
+    """
+    return render_template_string(html)
 
-if __name__ == '__main__':
-    print("Starting pipeline...")
-    update_system()
-    app.run(host='0.0.0.0', port=PORT)
+if __name__ == "__main__":
+    try:
+        main_logic()
+        print(f"Server starting on port {PORT}...")
+        app.run(host='0.0.0.0', port=PORT)
+    except Exception as e:
+        print(f"Error: {e}")
