@@ -1,427 +1,429 @@
-import os
-import ccxt
+import http.server
+import socketserver
 import pandas as pd
 import numpy as np
-import matplotlib
-matplotlib.use('Agg') # Non-interactive backend for server environment
+import requests
 import matplotlib.pyplot as plt
 import io
 import base64
-from flask import Flask, render_template_string
+import time
+import sys
+from datetime import datetime
+from collections import Counter, defaultdict
 
-# Configuration
-DATA_DIR = '/app/data'
-DATA_FILE = os.path.join(DATA_DIR, 'ohlc_2025.csv')
-SYMBOL = 'ETH/USDT'
-TIMEFRAME = '1h'
-START_DATE = '2024-01-01 00:00:00'
-END_DATE = '2026-01-01 00:00:00'
-SEQ_LEN = 3
-ROUNDING_STEP = 0.004  # 0.2%
-THRESHOLD = 0.01 
+# ---------------------------------------------------------
+# 7. All parameters defined at the top
+# ---------------------------------------------------------
+SYMBOL = 'BTCUSDT'
+INTERVAL = '1h'
+START_TIME = '2020-01-01'
+END_TIME = '2026-01-01'
 PORT = 8080
+GRID_PERCENT = 0.01  # 1%
+TRAIN_SPLIT_RATIO = 0.7
 
-app = Flask(__name__)
-
-def ensure_dir(directory):
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-
-def fetch_and_prepare_data():
-    ensure_dir(DATA_DIR)
+# ---------------------------------------------------------
+# 1. Fetch 1h ohlc from binance (Pagination logic included)
+# ---------------------------------------------------------
+def fetch_binance_data(symbol, interval, start_str, end_str):
+    print(f"Fetching {symbol} {interval} data from {start_str} to {end_str}...")
+    base_url = "https://api.binance.com/api/v3/klines"
     
-    # 1. Force Clean Slate: Remove old file to ensure fresh fetch
-    if os.path.exists(DATA_FILE):
-        os.remove(DATA_FILE)
+    start_ts = int(pd.Timestamp(start_str).timestamp() * 1000)
+    end_ts = int(pd.Timestamp(end_str).timestamp() * 1000)
     
-    print(f"Fetching fresh data for {SYMBOL} from Binance ({START_DATE} to {END_DATE})...")
-    exchange = ccxt.binance({'enableRateLimit': True}) 
+    all_data = []
     
-    since = int(pd.Timestamp(START_DATE).timestamp() * 1000)
-    end_ts = int(pd.Timestamp(END_DATE).timestamp() * 1000)
-    
-    all_candles = []
-    
-    # --- A. FETCH RAW DATA ---
-    while since < end_ts:
+    while start_ts < end_ts:
+        params = {
+            'symbol': symbol,
+            'interval': interval,
+            'startTime': start_ts,
+            'endTime': end_ts,
+            'limit': 1000
+        }
+        
         try:
-            ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
-            if not ohlcv: break
+            response = requests.get(base_url, params=params)
+            data = response.json()
             
-            all_candles.extend(ohlcv)
-            last_timestamp = ohlcv[-1][0]
-            since = last_timestamp + 1 
+            if not isinstance(data, list) or len(data) == 0:
+                break
+                
+            all_data.extend(data)
             
-            if last_timestamp >= end_ts: break
+            # Update start_ts to the last close time + 1ms
+            last_close_time = data[-1][6]
+            start_ts = last_close_time + 1
             
-            if len(all_candles) % 5000 == 0:
-                print(f"Fetched up to {pd.to_datetime(last_timestamp, unit='ms')}")
+            # Simple rate limit handling
+            time.sleep(0.1)
+            
+            # Progress indicator
+            sys.stdout.write(f"\rFetched {len(all_data)} candles...")
+            sys.stdout.flush()
             
         except Exception as e:
             print(f"Error fetching data: {e}")
             break
-
-    # 2. Create DataFrame and Set Timestamp as Index
-    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    
-    # !!! CRITICAL: Set Index to Timestamp. All subsequent column additions align to this. !!!
-    df.set_index('timestamp', inplace=True)
-    
-    # Filter strictly within range
-    df = df.sort_index()
-    mask = (df.index >= pd.Timestamp(START_DATE)) & (df.index < pd.Timestamp(END_DATE))
-    df = df.loc[mask]
-    
-    if df.empty:
-        return df
-
-    # --- B. ADD DERIVATIVE COLUMNS (Aligned by Timestamp) ---
-    deriv_cols = ['d_open', 'd_high', 'd_low', 'd_close']
-    for col in ['open', 'high', 'low', 'close']:
-        df[f'd_{col}'] = df[col].pct_change().fillna(0)
-
-    # --- C. ADD NORMALIZED COLUMNS (Aligned by Timestamp) ---
-    first_vals = df.iloc[0]
-    norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
-    for col, n_col in zip(['open', 'high', 'low', 'close'], norm_cols):
-        df[n_col] = df[col] / first_vals[col]
-
-    # --- D. APPLY ROUNDING ---
-    cols_to_round = deriv_cols + norm_cols
-    df[cols_to_round] = (df[cols_to_round] / ROUNDING_STEP).round() * ROUNDING_STEP
-
-    df.to_csv(DATA_FILE)
-    print(f"Unified Data Saved: {len(df)} rows.")
-    
-    return df
-
-def train_model(train_df, input_cols):
-    pattern_map = {}
-    data_values = train_df[input_cols].values
-    train_outcomes = (train_df['close'].shift(-1) - train_df['close']) / train_df['close']
-    
-    for i in range(SEQ_LEN - 1, len(train_df) - 1):
-        seq_array = data_values[i-SEQ_LEN+1 : i+1] 
-        seq = tuple(seq_array.flatten()) 
-        
-        outcome_val = train_outcomes.iloc[i]
-        
-        if outcome_val > THRESHOLD: label = 'UP'
-        elif outcome_val < -THRESHOLD: label = 'DOWN'
-        else: label = 'FLAT'
             
-        if seq not in pattern_map:
-            pattern_map[seq] = {'UP': 0, 'DOWN': 0, 'FLAT': 0, 'total': 0}
+    print("\nData fetch complete.")
+    
+    # Create DataFrame
+    df = pd.DataFrame(all_data, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_asset_volume', 'trades', 
+        'taker_buy_base', 'taker_buy_quote', 'ignore'
+    ])
+    
+    # Convert types
+    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+    df['close'] = df['close'].astype(float)
+    
+    # Keep only necessary columns
+    return df[['open_time', 'close']]
+
+# ---------------------------------------------------------
+# Processing & Backtesting Logic
+# ---------------------------------------------------------
+def run_backtest(df):
+    # 2. Round close to 1% * first close
+    first_close = df['close'].iloc[0]
+    grid_size = first_close * GRID_PERCENT
+    
+    print(f"First Close: {first_close}, Grid Size (1%): {grid_size}")
+    
+    # Rounding logic: round(value / step) * step
+    df['rounded_close'] = (df['close'] / grid_size).round() * grid_size
+    
+    # Prepare Sequences
+    # We need sequences of 3 rounded closes -> Next Direction
+    # Direction logic: 
+    # If next_rounded > curr_rounded -> UP
+    # If next_rounded < curr_rounded -> DOWN
+    # Else -> FLAT
+    
+    # Shift to get next value
+    df['next_rounded'] = df['rounded_close'].shift(-1)
+    df['next_close_raw'] = df['close'].shift(-1)
+    
+    conditions = [
+        df['next_rounded'] > df['rounded_close'],
+        df['next_rounded'] < df['rounded_close']
+    ]
+    choices = ['UP', 'DOWN']
+    df['target_direction'] = np.select(conditions, choices, default='FLAT')
+    
+    # Create sequences of length 3
+    # We need input: [t-2, t-1, t] to predict t+1
+    # Create lag columns for the sequence
+    df['t_0'] = df['rounded_close']
+    df['t_1'] = df['rounded_close'].shift(1)
+    df['t_2'] = df['rounded_close'].shift(2)
+    
+    # Drop NaNs created by shifting
+    data = df.dropna().copy()
+    
+    # 3. Split train/test
+    split_idx = int(len(data) * TRAIN_SPLIT_RATIO)
+    train_df = data.iloc[:split_idx]
+    test_df = data.iloc[split_idx:]
+    
+    print(f"Training samples: {len(train_df)}, Test samples: {len(test_df)}")
+    
+    # 4. For each unique sequence of 3 find the most frequent next close direction
+    # Map: (val1, val2, val3) -> Direction
+    sequence_map = defaultdict(list)
+    
+    for _, row in train_df.iterrows():
+        seq = (row['t_2'], row['t_1'], row['t_0'])
+        sequence_map[seq].append(row['target_direction'])
         
-        pattern_map[seq][label] += 1
-        pattern_map[seq]['total'] += 1
+    # Consolidate to most frequent
+    model = {}
+    for seq, directions in sequence_map.items():
+        counts = Counter(directions)
+        most_common = counts.most_common(1)[0][0]
+        model[seq] = most_common
         
-    prediction_rules = {}
-    sequence_stats = []
-
-    for seq, counts in pattern_map.items():
-        outcomes = {k: v for k, v in counts.items() if k != 'total'}
-        best_outcome = max(outcomes, key=outcomes.get)
-        prediction_rules[seq] = best_outcome
-        
-        sequence_stats.append({
-            'sequence': seq,
-            'total_count': counts['total'],
-            'predicted_outcome': best_outcome,
-            'up': counts['UP'],
-            'down': counts['DOWN'],
-            'flat': counts['FLAT']
-        })
-        
-    return prediction_rules, sequence_stats
-
-def build_sequences_and_predict(df):
-    if len(df) < SEQ_LEN:
-        return {}, {}, df, []
-
-    # Use the unified DF for splitting
-    split_idx = int(len(df) * 0.8)
-    train_df = df.iloc[:split_idx].copy()
-    test_df = df.iloc[split_idx:].copy()
-
-    print("Training Derivative Model...")
-    deriv_cols = ['d_open', 'd_high', 'd_low', 'd_close']
-    deriv_rules, deriv_stats = train_model(train_df, deriv_cols)
-
-    print("Training Raw Normalized Model...")
-    norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
-    norm_rules, norm_stats = train_model(train_df, norm_cols)
-
-    deriv_stats.sort(key=lambda x: x['total_count'], reverse=True)
-    top_10_sequences = deriv_stats[:10]
-
-    return deriv_rules, norm_rules, test_df, top_10_sequences
-
-def run_backtest(deriv_rules, norm_rules, test_df):
+    # 5. Test on test sequences to obtain accuracy and pnl
     results = []
-    if len(test_df) < SEQ_LEN:
-        return pd.DataFrame(), {}, [], []
-
-    d_data = test_df[['d_open', 'd_high', 'd_low', 'd_close']].values
-    n_data = test_df[['n_open', 'n_high', 'n_low', 'n_close']].values
-    
+    correct_predictions = 0
+    total_predictions = 0
     cumulative_pnl = 0.0
-    wins = 0
-    total_trades = 0
     
-    pnl_history = [0]
-    dates = [test_df.index[0]]
-
-    print("Running backtest...")
-    for i in range(SEQ_LEN - 1, len(test_df) - 1):
+    # Iterate through test set
+    test_results_list = []
+    
+    for idx, row in test_df.iterrows():
+        seq = (row['t_2'], row['t_1'], row['t_0'])
         
-        # --- 1. PREDICTION LOGIC ---
-        seq_array_d = d_data[i-SEQ_LEN+1 : i+1]
-        seq_d = tuple(seq_array_d.flatten())
-        pred_deriv = deriv_rules.get(seq_d, 'FLAT')
-
-        seq_array_n = n_data[i-SEQ_LEN+1 : i+1]
-        seq_n = tuple(seq_array_n.flatten())
-        pred_norm = norm_rules.get(seq_n, 'FLAT')
+        # Prediction
+        prediction = model.get(seq, 'FLAT') # Default to FLAT if unseen
         
-        final_pred = 'FLAT'
-        if (pred_deriv == 'UP' and pred_norm == 'DOWN') or \
-           (pred_deriv == 'DOWN' and pred_norm == 'UP'):
-            final_pred = 'FLAT' 
-        else:
-            if pred_deriv == 'UP' or pred_norm == 'UP':
-                final_pred = 'UP'
-            elif pred_deriv == 'DOWN' or pred_norm == 'DOWN':
-                final_pred = 'DOWN'
-            else:
-                final_pred = 'FLAT'
-
-        # --- 2. TRADE EXECUTION (Candle i+1) ---
-        trade_candle = test_df.iloc[i+1]
-        entry_price = trade_candle['open']
-        exit_price = trade_candle['close']
+        actual = row['target_direction']
+        is_correct = (prediction == actual)
+        
+        if is_correct:
+            correct_predictions += 1
+        total_predictions += 1
+        
+        # PnL Calculation
+        # Strategy: 
+        # UP prediction -> Long (Profit = Next Close - Curr Close)
+        # DOWN prediction -> Short (Profit = Curr Close - Next Close)
+        # FLAT -> No trade
+        
+        # Note: Using raw close prices for PnL to reflect real money, 
+        # though logic is based on rounded grid.
+        curr_price = row['close']
+        next_price = row['next_close_raw']
         
         trade_pnl = 0.0
-        if final_pred == 'UP':
-            trade_pnl = (exit_price - entry_price) / entry_price
-        elif final_pred == 'DOWN':
-            trade_pnl = -(exit_price - entry_price) / entry_price
-        
-        if final_pred != 'FLAT':
-            cumulative_pnl += trade_pnl
-            total_trades += 1
-            if trade_pnl > 0: wins += 1
+        if prediction == 'UP':
+            trade_pnl = next_price - curr_price
+        elif prediction == 'DOWN':
+            trade_pnl = curr_price - next_price
             
-            pnl_history.append(cumulative_pnl)
-            dates.append(trade_candle.name) 
-            
-            # A. Input Sequence Candles
-            input_candles_str = ""
-            for k in range(SEQ_LEN):
-                idx_loc = i - SEQ_LEN + 1 + k
-                row = test_df.iloc[idx_loc]
-                
-                ts_str = row.name.strftime('%Y-%m-%d %H:%M')
-                input_candles_str += f"[{k+1}] {ts_str} | O:{row['open']:.2f} H:{row['high']:.2f} L:{row['low']:.2f} C:{row['close']:.2f}<br>"
-
-            # B. Target Candle
-            trade_ts_str = trade_candle.name.strftime('%Y-%m-%d %H:%M')
-            trade_ohlc_str = f"{trade_ts_str}<br>O:{trade_candle['open']:.2f} H:{trade_candle['high']:.2f} L:{trade_candle['low']:.2f} C:{trade_candle['close']:.2f}"
-            
-            results.append({
-                'timestamp': trade_candle.name,
-                'input_sequence_raw': input_candles_str,
-                'trade_candle_raw': trade_ohlc_str,
-                'pred_deriv': pred_deriv,
-                'pred_norm': pred_norm,
-                'final_prediction': final_pred,
-                'pnl': round(trade_pnl * 100, 2),
-                'cum_pnl': round(cumulative_pnl * 100, 2)
-            })
-
-    stats = {
-        'total_trades': total_trades,
-        'win_rate': round((wins / total_trades * 100), 2) if total_trades > 0 else 0,
-        'final_pnl_pct': round(cumulative_pnl * 100, 2)
-    }
-    
-    return pd.DataFrame(results), stats, dates, pnl_history
-
-def generate_charts(df, pnl_dates, pnl_history):
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
-    
-    norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
-    plot_data = df[norm_cols]
-    ax1.plot(plot_data.index, plot_data['n_close'], label='Norm Close', linewidth=1)
-    ax1.set_title('Normalized OHLC (Close Price, Rounded)')
-    ax1.legend()
-    ax1.grid(True)
-
-    deriv_cols = ['d_open', 'd_high', 'd_low', 'd_close']
-    plot_deriv = df[deriv_cols]
-    ax2.plot(plot_deriv.index, plot_deriv['d_close'], label='Deriv Close', color='orange', linewidth=0.5)
-    ax2.set_title('Derivative OHLC (Close, Rounded)')
-    ax2.legend()
-    ax2.grid(True)
-
-    if len(pnl_dates) > 1:
-        ax3.plot(pnl_dates, pnl_history, label='Strategy PnL', color='green')
-    else:
-        ax3.text(0.5, 0.5, 'Not enough trades', ha='center')
-    ax3.set_title(f'Strategy PnL ({START_DATE} - {END_DATE})')
-    ax3.set_ylabel('PnL (Decimal)')
-    ax3.grid(True)
-
-    plt.tight_layout()
-    img = io.BytesIO()
-    plt.savefig(img, format='png')
-    img.seek(0)
-    plt.close()
-    return base64.b64encode(img.getvalue()).decode()
-
-def generate_table_html(df_slice):
-    """
-    Helper to generate a consistent HTML table for a given dataframe slice.
-    Includes a scrollable div wrapper.
-    """
-    html = '<div style="max-height: 500px; overflow-y: auto;">'
-    html += '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
-    html += '<thead class="thead-light" style="position: sticky; top: 0; z-index: 1;">'
-    html += '<tr>'
-    html += '<th rowspan="2" style="vertical-align: middle;">Timestamp (UTC)</th>'
-    html += '<th colspan="4">Raw Binance Data (USD)</th>'
-    html += '<th colspan="4">Normalized (Rounded)</th>'
-    html += '<th colspan="4">Derivative % (Rounded)</th>'
-    html += '</tr>'
-    html += '<tr>'
-    html += '<th>Open</th><th>High</th><th>Low</th><th>Close</th>'
-    html += '<th>O</th><th>H</th><th>L</th><th>C</th>'
-    html += '<th>O</th><th>H</th><th>L</th><th>C</th>'
-    html += '</tr>'
-    html += '</thead>'
-    html += '<tbody>'
-    
-    for index, row in df_slice.iterrows():
-        ts_str = index.strftime('%Y-%m-%d %H:%M')
-        r_vals = f"<td>{row['open']:.2f}</td><td>{row['high']:.2f}</td><td>{row['low']:.2f}</td><td>{row['close']:.2f}</td>"
-        n_vals = f"<td>{row['n_open']:.4f}</td><td>{row['n_high']:.4f}</td><td>{row['n_low']:.4f}</td><td>{row['n_close']:.4f}</td>"
-        d_vals = f"<td>{row['d_open']:.4f}</td><td>{row['d_high']:.4f}</td><td>{row['d_low']:.4f}</td><td>{row['d_close']:.4f}</td>"
+        cumulative_pnl += trade_pnl
         
-        html += f"<tr><td>{ts_str}</td>{r_vals}{n_vals}{d_vals}</tr>"
+        # Save for table (Paginated display)
+        # 9. Show input prices with timestamp and target price w/ timestamp
+        # We need to recover timestamps for t-2 and t-1
+        # Since we are iterating rows, row['open_time'] is time T.
+        # T-1 is T - 1h, T-2 is T - 2h
         
-    html += '</tbody></table></div>'
-    return html
-
-report_data = {}
-
-def main_logic():
-    df = fetch_and_prepare_data()
-    if df.empty: 
-        print("Error: No data fetched.")
-        return
-
-    # Filter for the specific range requested: Dec 29th 2025 to end of data (2026)
-    # Using string slicing with pandas datetime index
-    try:
-        # Start from Dec 29, 2025. End is implicit (end of data)
-        custom_slice = df.loc['2025-12-29':]
-        report_data['custom_range'] = generate_table_html(custom_slice)
-    except Exception as e:
-        print(f"Error slicing data: {e}")
-        report_data['custom_range'] = "<p>Error filtering data range.</p>"
-    
-    # Run predictions
-    deriv_rules, norm_rules, test_df, top_seq = build_sequences_and_predict(df)
-    results_df, stats, dates, pnl_curve = run_backtest(deriv_rules, norm_rules, test_df)
-    
-    plot_url = generate_charts(df, dates, pnl_curve)
-    
-    formatted_seq = []
-    for item in top_seq:
-        seq_str = ', '.join([f"{x:.3f}" for x in item['sequence']])
-        formatted_seq.append({
-            'sequence': f"<small>{seq_str}</small>",
-            'count': item['total_count'],
-            'prediction': item['predicted_outcome'],
-            'breakdown': f"U:{item['up']} D:{item['down']} F:{item['flat']}"
+        test_results_list.append({
+            'time_t': row['open_time'],
+            'price_t': row['close'],
+            'price_t_rounded': row['t_0'],
+            'price_t_1': row['t_1'],
+            'price_t_2': row['t_2'],
+            'prediction': prediction,
+            'actual': actual,
+            'pnl': trade_pnl,
+            'cum_pnl': cumulative_pnl,
+            'next_price': next_price
         })
-    
-    seq_df = pd.DataFrame(formatted_seq)
-
-    report_data['stats'] = stats
-    report_data['plot'] = plot_url
-    report_data['top_sequences'] = seq_df.to_html(classes='table table-bordered table-sm', escape=False, index=False)
-    if not results_df.empty:
-        report_data['table'] = results_df.tail(20).to_html(classes='table table-striped table-sm', index=False, escape=False)
-    else:
-        report_data['table'] = "<p>No trades executed in test set.</p>"
-
-@app.route('/')
-def home():
-    if not report_data:
-        return "Processing data... please refresh in a moment."
-    
-    html = f"""
-    <html>
-    <head>
-        <title>Crypto Prediction Bot</title>
-        <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
-        <style>
-            body{{ padding: 20px; }}
-            .chart-container {{ margin-bottom: 30px; }}
-            td {{ vertical-align: middle !important; font-size: 0.85rem; }}
-            td small {{ display: block; line-height: 1.2; }}
-            table tr td:nth-child(2) {{ font-family: monospace; font-size: 0.75rem; white-space: nowrap; }}
-        </style>
-    </head>
-    <body>
-        <h1>{SYMBOL} Analysis ({START_DATE} - {END_DATE})</h1>
-        <hr>
         
-        <div class="row">
-            <div class="col-md-12 chart-container">
-                <img src="data:image/png;base64,{report_data.get('plot', '')}" style="width:100%">
-            </div>
+    accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
+    
+    print(f"Accuracy: {accuracy:.2f}%")
+    print(f"Total PnL: {cumulative_pnl:.2f}")
+    
+    return train_df, test_df, test_results_list, accuracy, cumulative_pnl
+
+# ---------------------------------------------------------
+# 6. Serve plot and table on port 8080 (Matplotlib + http.server)
+# ---------------------------------------------------------
+def create_plot(df, test_results):
+    plt.figure(figsize=(12, 6))
+    
+    # Plot entire price history
+    plt.plot(df['open_time'], df['close'], label='Price', color='gray', alpha=0.5)
+    
+    # Plot Equity Curve for the test period
+    test_times = [x['time_t'] for x in test_results]
+    test_pnl = [x['cum_pnl'] for x in test_results]
+    
+    # Create a secondary axis for PnL
+    ax1 = plt.gca()
+    ax2 = ax1.twinx()
+    ax2.plot(test_times, test_pnl, label='Strategy PnL', color='blue')
+    
+    ax1.set_ylabel('Price (USDT)')
+    ax2.set_ylabel('Cumulative PnL (USDT)')
+    plt.title(f'Backtest Results: {SYMBOL} | Acc: {accuracy:.2f}% | PnL: {total_pnl:.2f}')
+    
+    # Save to base64
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    image_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    plt.close()
+    return image_base64
+
+# HTML Template with Client-Side Pagination script
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Binance Backtest Results</title>
+    <style>
+        body {{ font-family: sans-serif; margin: 20px; }}
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        img {{ max-width: 100%; height: auto; border: 1px solid #ddd; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 0.9em; }}
+        th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
+        th {{ background-color: #f2f2f2; }}
+        .pagination {{ margin-top: 20px; text-align: center; }}
+        button {{ padding: 5px 10px; margin: 0 5px; cursor: pointer; }}
+        .up {{ color: green; font-weight: bold; }}
+        .down {{ color: red; font-weight: bold; }}
+        .stats {{ background: #f9f9f9; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Backtest Report: {symbol}</h1>
+        
+        <div class="stats">
+            <strong>Interval:</strong> {interval} | 
+            <strong>Start:</strong> {start} | 
+            <strong>End:</strong> {end} <br>
+            <strong>Accuracy:</strong> {accuracy:.2f}% | 
+            <strong>Total PnL:</strong> {pnl:.2f} USDT
+        </div>
+
+        <h3>Equity Curve & Price</h3>
+        <img src="data:image/png;base64,{plot_data}" />
+
+        <h3>Prediction Log</h3>
+        <div id="table-container">
+            <table id="resultsTable">
+                <thead>
+                    <tr>
+                        <th>Time (T)</th>
+                        <th>Input Seq (Rounded) [T-2, T-1, T]</th>
+                        <th>Actual Price (T)</th>
+                        <th>Prediction</th>
+                        <th>Target Price (T+1)</th>
+                        <th>Actual Dir</th>
+                        <th>PnL</th>
+                    </tr>
+                </thead>
+                <tbody id="tableBody"></tbody>
+            </table>
         </div>
         
-        <div class="row">
-            <div class="col-md-12">
-                <h3>Unified Data Inspection</h3>
-                <p>Showing data from <strong>Dec 29, 2025 through 2026</strong> (Raw, Normalized, Derivative).</p>
-                {report_data.get('custom_range', '')}
-            </div>
+        <div class="pagination">
+            <button onclick="prevPage()">Previous</button>
+            <span id="pageInfo"></span>
+            <button onclick="nextPage()">Next</button>
         </div>
-        <hr>
+    </div>
 
-        <div class="row">
-            <div class="col-md-4">
-                <h3>Performance Stats</h3>
-                <ul class="list-group">
-                    <li class="list-group-item">Total Trades: {report_data.get('stats', {}).get('total_trades', 0)}</li>
-                    <li class="list-group-item">Win Rate: {report_data.get('stats', {}).get('win_rate', 0)}%</li>
-                    <li class="list-group-item">Final PnL: {report_data.get('stats', {}).get('final_pnl_pct', 0)}%</li>
-                </ul>
-            </div>
+    <script>
+        // Data injected from Python
+        const data = {json_data};
+        const rowsPerPage = 20;
+        let currentPage = 1;
+
+        function renderTable() {{
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = '';
+
+            const start = (currentPage - 1) * rowsPerPage;
+            const end = start + rowsPerPage;
+            const pageData = data.slice(start, end);
+
+            pageData.forEach(row => {{
+                const tr = document.createElement('tr');
+                
+                // Format prediction color
+                const predClass = row.prediction === 'UP' ? 'up' : (row.prediction === 'DOWN' ? 'down' : '');
+                const actualClass = row.actual === 'UP' ? 'up' : (row.actual === 'DOWN' ? 'down' : '');
+                
+                tr.innerHTML = `
+                    <td>${{row.time_t}}</td>
+                    <td>[${{row.price_t_2}}, ${{row.price_t_1}}, ${{row.price_t_rounded}}]</td>
+                    <td>${{row.price_t.toFixed(2)}}</td>
+                    <td class="${{predClass}}">${{row.prediction}}</td>
+                    <td>${{row.next_price.toFixed(2)}}</td>
+                    <td class="${{actualClass}}">${{row.actual}}</td>
+                    <td style="color: ${{row.pnl >= 0 ? 'green' : 'red'}}">${{row.pnl.toFixed(2)}}</td>
+                `;
+                tbody.appendChild(tr);
+            }});
+
+            document.getElementById('pageInfo').innerText = `Page ${{currentPage}} of ${{Math.ceil(data.length / rowsPerPage)}}`;
+        }}
+
+        function prevPage() {{
+            if (currentPage > 1) {{
+                currentPage--;
+                renderTable();
+            }}
+        }}
+
+        function nextPage() {{
+            if (currentPage * rowsPerPage < data.length) {{
+                currentPage++;
+                renderTable();
+            }}
+        }}
+
+        // Initial Render
+        renderTable();
+    </script>
+</body>
+</html>
+"""
+
+class BacktestHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        
+        # Prepare data for JS (Converting timestamps to string for JSON serialization)
+        # We limit the data passed to JS to avoid browser memory issues if millions of rows,
+        # but for 5 years of 1h data (~50k rows), it's fine.
+        js_data = []
+        for r in test_results:
+            js_data.append({
+                'time_t': str(r['time_t']),
+                'price_t_2': r['price_t_2'],
+                'price_t_1': r['price_t_1'],
+                'price_t_rounded': r['price_t_rounded'],
+                'price_t': r['price_t'],
+                'prediction': r['prediction'],
+                'next_price': r['next_price'],
+                'actual': r['actual'],
+                'pnl': r['pnl']
+            })
             
-            <div class="col-md-8">
-                <h3>Top 10 Frequent Sequences (Derivative)</h3>
-                {report_data.get('top_sequences', '')}
-            </div>
-        </div>
+        import json
+        json_str = json.dumps(js_data)
+        
+        html_content = HTML_TEMPLATE.format(
+            symbol=SYMBOL,
+            interval=INTERVAL,
+            start=START_TIME,
+            end=END_TIME,
+            accuracy=accuracy,
+            pnl=total_pnl,
+            plot_data=plot_b64,
+            json_data=json_str
+        )
+        
+        self.wfile.write(html_content.encode('utf-8'))
 
-        <hr>
-        <h3>Recent Test Trades (Last 20)</h3>
-        {report_data.get('table', '')}
-    </body>
-    </html>
-    """
-    return render_template_string(html)
-
+# ---------------------------------------------------------
+# Execution
+# ---------------------------------------------------------
 if __name__ == "__main__":
-    try:
-        main_logic()
-        print(f"Server starting on port {PORT}...")
-        app.run(host='0.0.0.0', port=PORT)
-    except Exception as e:
-        print(f"Error: {e}")
+    # 1. Fetch
+    df = fetch_binance_data(SYMBOL, INTERVAL, START_TIME, END_TIME)
+    
+    if df.empty:
+        print("No data fetched. Exiting.")
+        sys.exit(1)
+        
+    # 2-5. Process, Train, Test
+    train_df, test_df, test_results, accuracy, total_pnl = run_backtest(df)
+    
+    # 6. Generate Plot
+    print("Generating plot...")
+    plot_b64 = create_plot(df, test_results)
+    
+    # 7. Serve
+    print(f"Starting server on port {PORT}...")
+    print(f"Open your browser at http://localhost:{PORT}")
+    
+    with socketserver.TCPServer(("", PORT), BacktestHandler) as httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nServer stopped.")
+            httpd.server_close()
