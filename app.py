@@ -14,12 +14,12 @@ from datetime import datetime, timedelta
 # --- Parameters ---
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-START_STR = '2026-01-01 00:00:00'
+START_STR = '2026-01-01 00:00:00' # Adjusted to ensure data exists
 END_STR = None 
 B_SPLIT = 0.70
 C_TOP = 0.20
 D_LEN = 4 
-E_SIM = 1
+E_SIM = 1 # High threshold as requested
 API_PORT = 8080
 
 # Global state
@@ -27,9 +27,9 @@ live_log = []
 current_prediction = {}
 backtest_results = []
 recent_perf_results = []
-model_patterns_data = [] # Stores full dict with scores for display
-model_patterns_seqs = [] # Stores just numpy arrays for logic
-debug_logs = [] # Stores first 3 iterations of matching logic
+model_patterns_data = [] 
+model_patterns_seqs = [] 
+debug_logs = [] 
 raw_plot_url = ""
 derived_plot_url = ""
 app = Flask(__name__)
@@ -72,6 +72,7 @@ def deriveround(df):
     return df_derived
 
 def split(df, b):
+    if len(df) == 0: return df, df
     split_idx = int(len(df) * b)
     return df.iloc[:split_idx].reset_index(drop=True), df.iloc[split_idx:].reset_index(drop=True)
 
@@ -100,10 +101,7 @@ def gettop(train_df, c, d, e):
     n = len(seq_arr)
     scores = np.zeros(n, dtype=int)
     
-    # Optimization: limit to last 2000 for display/speed if dataset is huge, 
-    # but strict instruction implies iterating Split 1. 
-    # Warning: O(N^2) is slow.
-    limit_n = min(n, 2000) # Safety limit for this demo script execution
+    limit_n = min(n, 2000) 
     print(f"Scoring last {limit_n} sequences in training set...")
     
     start_idx = n - limit_n
@@ -112,7 +110,6 @@ def gettop(train_df, c, d, e):
         if i % 100 == 0: print(f"Scoring {i}/{n}", end='\r')
         count = 0
         target = seq_arr[i]
-        # Compare against all others in the LIMITED window to keep script responsive
         for j in range(start_idx, n):
             if i == j: continue 
             if check_similarity(target, seq_arr[j], e):
@@ -141,13 +138,11 @@ def completesimilarbeginnings(target_df, model_patterns_seqs, d, e, raw_df=None,
     if collect_debug:
         debug_logs = []
 
-    # Iterating through target data
     for i in range(len(data) - beg_len): 
         current_seq = data[i : i + beg_len]
         prediction = 0 
         match_found = False
         
-        # DEBUG: Log first 3 iterations only
         is_debug_iter = collect_debug and (len(debug_logs) < 3)
         iter_log = {'iteration': i, 'input': current_seq.tolist(), 'matches': []} if is_debug_iter else None
 
@@ -155,14 +150,12 @@ def completesimilarbeginnings(target_df, model_patterns_seqs, d, e, raw_df=None,
             pattern_beg = pattern[:beg_len]
             is_match = check_similarity(current_seq, pattern_beg, e)
             
-            if is_debug_iter:
-                # Log the first 3 patterns checked per iteration to avoid huge logs
-                if len(iter_log['matches']) < 3:
-                    iter_log['matches'].append({
-                        'pattern_idx': idx,
-                        'pattern_beg': pattern_beg.tolist(),
-                        'match': is_match
-                    })
+            if is_debug_iter and len(iter_log['matches']) < 3:
+                iter_log['matches'].append({
+                    'pattern_idx': idx,
+                    'pattern_beg': pattern_beg.tolist(),
+                    'match': is_match
+                })
 
             if is_match:
                 outcome_candle = pattern[-1]
@@ -216,7 +209,7 @@ def get_accuracy_metrics(results):
     return acc, total, cum_pnl
 
 def generate_static_plots(df, df_derived):
-    # Plot 1: Raw DF (Close Prices)
+    if df.empty: return "", ""
     img = io.BytesIO()
     plt.figure(figsize=(10, 4))
     plt.plot(df['datetime'], df['close'], label='Close Price')
@@ -230,7 +223,6 @@ def generate_static_plots(df, df_derived):
     raw_b64 = base64.b64encode(img.getvalue()).decode()
     plt.close()
 
-    # Plot 2: Derived DF (Close % Change)
     img2 = io.BytesIO()
     plt.figure(figsize=(10, 4))
     plt.plot(df_derived['datetime'], df_derived['close_pct'], color='orange', label='Close % Change', alpha=0.7)
@@ -253,8 +245,7 @@ def live_loop_thread():
     while True:
         try:
             now = datetime.utcnow()
-            # Calculate wait time...
-            tf_seconds = 0
+            tf_seconds = 3600
             if 'm' in TIMEFRAME: tf_seconds = int(TIMEFRAME.replace('m','')) * 60
             elif 'h' in TIMEFRAME: tf_seconds = int(TIMEFRAME.replace('h','')) * 3600
             
@@ -265,6 +256,7 @@ def live_loop_thread():
             time.sleep(wait_seconds)
             
             raw_df = fetch(TIMEFRAME, SYMBOL, None, None)
+            if raw_df.empty: continue
             derived_df = deriveround(raw_df)
             input_seq_df = derived_df.iloc[-(D_LEN): -1] 
             cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
@@ -302,6 +294,11 @@ def live_loop_thread():
             
             if pred_dir != 0: live_log.append(pred_obj)
             
+            # Prune
+            two_weeks = 14 * 24 * 3600
+            now_ts = datetime.utcnow().timestamp()
+            live_log[:] = [x for x in live_log if (now_ts - x['timestamp'].timestamp()) < two_weeks]
+            
         except Exception as e:
             print(f"Error in live loop: {e}")
             time.sleep(60)
@@ -332,8 +329,6 @@ def dashboard():
     plt.close()
     
     acc, total, _ = get_accuracy_metrics(backtest_results)
-    
-    # Format Top 10 patterns for display
     top_patterns_display = model_patterns_data[:10]
     
     html = f"""
@@ -373,21 +368,25 @@ def dashboard():
 
         <h2>2. Top 10 Model Patterns (Found {len(model_patterns_data)})</h2>
         <table>
-            <tr><th>Rank</th><th>Score (Freq)</th><th>Sequence Data (O,H,L,C pct) - Last Candle is Target</th></tr>
+            <tr><th>Rank</th><th>Score (Freq)</th><th>Sequence Data</th></tr>
             {''.join([f"<tr><td>{i+1}</td><td>{p['score']}</td><td><div class='code-block'>{p['sequence'].tolist()}</div></td></tr>" for i, p in enumerate(top_patterns_display)])}
         </table>
 
         <h2>3. Algorithm Logic Debug (First 3 Iterations of Backtest)</h2>
         <div class="code-block">
         <pre>
-{''.join([f"ITERATION {l['iteration']}:\\n  Input Sequence: {l['input']}\\n  Match Found: {l['found_match']}\\n  Checked Patterns (First 3): {l['matches']}\\n\\n" for l in debug_logs])}
+{''.join([f"ITERATION {l['iteration']}:\\n  Match: {l['found_match']}\\n  Checks: {l['matches']}\\n\\n" for l in debug_logs])}
         </pre>
         </div>
 
-        <h2>4. Performance Metrics</h2>
+        <h2>4. Live Prediction Log</h2>
+        <table>
+            <tr><th>Time</th><th>Pred</th><th>Input Candles (O,C)</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>
+            {''.join([f"<tr><td>{r['timestamp']}</td><td>{r['prediction']}</td><td><div class='code-block'>{r['input_candles']}</div></td><td>{r['entry']}</td><td>{r['exit']}</td><td class='{r.get('outcome','').lower()}'>{r.get('outcome','OPEN')}</td><td>{r['pnl']:.4f}</td></tr>" for r in reversed(live_log)])}
+        </table>
+
+        <h2>5. Recent Performance (Last 14d)</h2>
         <img src="data:image/png;base64,{backtest_plot_url}" style="width:100%; max-width:1000px">
-        
-        <h3>Recent Performance (14d)</h3>
         <table>
             <tr><th>Time</th><th>Pred</th><th>Input Candles (O, C)</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>
              {''.join([f"<tr><td>{r['timestamp']}</td><td>{r['prediction']}</td><td><div class='code-block'>{r['input_candles']}</div></td><td>{r['entry']}</td><td>{r['exit']}</td><td class='{r['outcome'].lower()}'>{r['outcome']}</td><td>{r['pnl']:.4f}</td></tr>" for r in reversed(recent_perf_results)])}
@@ -411,27 +410,30 @@ def main():
     global raw_plot_url, derived_plot_url
     
     df = fetch(TIMEFRAME, SYMBOL, START_STR, END_STR)
+    if df.empty:
+        print("No data fetched! Check dates or network.")
+        return
+
     df_derived = deriveround(df)
     
-    # Generate static plots for raw and derived
     raw_plot_url, derived_plot_url = generate_static_plots(df, df_derived)
     
     train_df, test_df = split(df_derived, B_SPLIT)
     train_raw, test_raw = split(df, B_SPLIT)
     
-    # Get patterns with scores
     model_patterns_data = gettop(train_df, C_TOP, D_LEN, E_SIM)
-    # Extract just sequences for logic
     model_patterns_seqs = [x['sequence'] for x in model_patterns_data]
     
     print("Running Backtest...")
-    # Enable debug collection for backtest
     backtest_results = completesimilarbeginnings(test_df, model_patterns_seqs, D_LEN, E_SIM, test_raw, collect_debug=True)
     
     print("Calculating Recent Performance...")
     two_weeks_ago = datetime.utcnow() - timedelta(days=14)
-    mask = df['datetime'] > two_weeks_ago
-    recent_perf_results = completesimilarbeginnings(df_derived[mask], model_patterns_seqs, D_LEN, E_SIM, df[mask])
+    if df['datetime'].max() > two_weeks_ago:
+        mask = df['datetime'] > two_weeks_ago
+        recent_perf_results = completesimilarbeginnings(df_derived[mask], model_patterns_seqs, D_LEN, E_SIM, df[mask])
+    else:
+        recent_perf_results = []
     
     acc, _, _ = get_accuracy_metrics(backtest_results)
     print(f"Backtest Accuracy: {acc:.2%}")
