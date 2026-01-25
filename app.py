@@ -40,7 +40,7 @@ recent_data = {}
 # --- Functions ---
 
 def fetch(timeframe, symbol, start_str, end_str):
-    """Fetches OHLCV data from Binance with basic retry logic."""
+    """Fetches OHLCV data from Binance."""
     print(f"Fetching {symbol} {timeframe} from {start_str} to {end_str}...")
     exchange = ccxt.binance()
     start_ts = exchange.parse8601(start_str)
@@ -54,40 +54,29 @@ def fetch(timeframe, symbol, start_str, end_str):
             candles = exchange.fetch_ohlcv(symbol, timeframe, since=current_ts, limit=1000)
             if not candles:
                 break
-            
-            # Filter out candles beyond end_ts
             candles = [c for c in candles if c[0] < end_ts]
             if not candles:
                 break
-
             ohlc += candles
             current_ts = candles[-1][0] + 1
             time.sleep(0.1) 
         except Exception as e:
             print(f"Error fetching: {e}")
-            if "Too Many Requests" in str(e) or "429" in str(e):
-                print("Rate limit hit. Sleeping 60s...")
-                time.sleep(60)
-            else:
-                break
+            time.sleep(10)
+            break
             
     df = pd.DataFrame(ohlc, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    
-    # Explicit float conversion
     cols = ['open', 'high', 'low', 'close', 'volume']
     df[cols] = df[cols].astype(float)
-    
     return df
 
 def deriveround(df):
-    """Applies returns calculation and PADS the first row to maintain length."""
+    """Applies returns calculation."""
     df = df.copy()
     cols = ['open', 'high', 'low', 'close']
     for col in cols:
-        # Fill NaN at index 0 with 0.0 to match length of raw OHLC
         df[f'{col}_ret'] = df[col].pct_change().fillna(0.0)
-    
     return df
 
 def split(df, b):
@@ -95,16 +84,29 @@ def split(df, b):
     return df.iloc[:split_idx].copy(), df.iloc[split_idx:].copy()
 
 def gettop(df_split1, c, d):
-    """Finds dense patterns in Split 1."""
+    """Finds dense patterns in Split 1 using EXPLICIT window construction."""
     print("Training model (finding dense patterns)...")
     
     data_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
-    data_values = df_split1[data_cols].values
+    # Explicit copy to ensure contiguous memory
+    data_values = df_split1[data_cols].values.copy()
     
-    # Shape: (N_windows, D, 4)
-    windows = np.lib.stride_tricks.sliding_window_view(data_values, window_shape=d, axis=0)
+    # --- Manual Window Construction (No Stride Tricks) ---
+    # We create a list of windows and stack them. Safe and robust.
+    window_list = []
+    num_windows = len(data_values) - d + 1
     
-    N = windows.shape[0]
+    if num_windows < 1:
+        print("Not enough data to train.")
+        return np.array([])
+
+    for i in range(num_windows):
+        window = data_values[i : i+d]
+        window_list.append(window)
+        
+    windows = np.array(window_list) # Shape (N, D, 4)
+    
+    N = len(windows)
     flat_windows = windows.reshape(N, -1)
     
     densities = np.zeros(N, dtype=int)
@@ -113,7 +115,6 @@ def gettop(df_split1, c, d):
     for i in range(0, N, chunk_size):
         end = min(i + chunk_size, N)
         batch = flat_windows[i:end]
-        
         compare_set = flat_windows if N < 10000 else flat_windows[::5]
         
         for j in range(len(batch)):
@@ -128,40 +129,37 @@ def gettop(df_split1, c, d):
     return windows[top_indices]
 
 def completesimilarbeginnings(df_target, model_patterns, e, d):
-    """Predicts using a unified dataframe where OHLC and Returns are aligned 1:1."""
+    """
+    Predicts using explicit manual windows for both math and data.
+    """
     print("Running predictions...")
     
     if len(df_target) < d:
-        print(f"Warning: Not enough data for predictions. Need {d}, got {len(df_target)}.")
         return pd.DataFrame()
 
-    # Define columns
+    # --- 1. Prepare Math Data (Manual Windowing) ---
     ret_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
-    ohlc_cols = ['open', 'high', 'low', 'close'] # Raw prices
+    ret_values = df_target[ret_cols].values.copy()
     
-    # Extract values (Lengths are now identical)
-    ret_values = df_target[ret_cols].values
-    ohlc_values = df_target[ohlc_cols].values
-    timestamps = df_target['timestamp'].values
+    # Construct windows list manually
+    window_list = []
+    num_windows = len(ret_values) - d + 1
     
-    # Create windows
-    # Window 'i' contains indices [i, i+1, ... i+D-1]
-    ret_windows = np.lib.stride_tricks.sliding_window_view(ret_values, window_shape=d, axis=0)
-    ohlc_windows = np.lib.stride_tricks.sliding_window_view(ohlc_values, window_shape=d, axis=0)
-    ts_windows = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=d, axis=0)
+    for i in range(num_windows):
+        window_list.append(ret_values[i : i+d])
+        
+    ret_windows = np.array(window_list) # Shape (N, D, 4)
     
     predictions = []
     
     # Model Setup
-    model_context = model_patterns[:, :d-1, :] # (K, D-1, 4)
-    model_outcome = model_patterns[:, -1, :]   # (K, 4)
+    model_context = model_patterns[:, :d-1, :]
+    model_outcome = model_patterns[:, -1, :]
     model_context_flat = model_context.reshape(model_context.shape[0], -1)
     
+    # --- 2. Iterate ---
     for i in range(len(ret_windows)):
-        # Current Window of Length D
-        # Indices in window: 0, 1, ..., D-1
-        
-        # CONTEXT: Indices 0 to D-2 (The pattern we see)
+        # Match Pattern
         current_context_ret = ret_windows[i, :d-1, :]
         current_context_flat = current_context_ret.reshape(-1)
         
@@ -170,30 +168,29 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
         
         if len(matches_idx) > 0:
             matched_outcomes = model_outcome[matches_idx]
-            avg_return = np.mean(matched_outcomes[:, 3]) # Close return
+            avg_return = np.mean(matched_outcomes[:, 3])
             
             predicted_dir = 1 if avg_return > 0 else -1
             if avg_return == 0: predicted_dir = 0
             
-            # ACTUALS
-            # Target is the LAST candle in the window (Index D-1)
-            actual_ret = ret_windows[i, -1, 3]
+            # --- 3. Data Retrieval (Explicit DataFrame Indexing) ---
+            # i corresponds to the window starting at DataFrame index i
+            # The target (outcome) is at index i + d - 1
+            target_idx = i + d - 1
+            
+            actual_ret = df_target.iloc[target_idx]['close_ret']
             actual_dir = 1 if actual_ret > 0 else -1
             if actual_ret == 0: actual_dir = 0
             
-            # METADATA
-            # Entry Time: Timestamp of the Target candle (Index D-1)
-            ts = pd.to_datetime(ts_windows[i, -1])
+            ts = df_target.iloc[target_idx]['timestamp']
+            entry_price = df_target.iloc[target_idx - 1]['close']
+            exit_price = df_target.iloc[target_idx]['close']
             
-            # Entry Price: Close of the Last Context Candle (Index D-2)
-            entry_price = ohlc_windows[i, -2, 3]
+            # Input Context: Explicitly fetch rows [i : target_idx]
+            context_df = df_target.iloc[i : target_idx]
             
-            # Exit Price: Close of the Target Candle (Index D-1)
-            exit_price = ohlc_windows[i, -1, 3]
-            
-            # Input Logs: Indices 0 to D-2
-            input_timestamps = pd.to_datetime(ts_windows[i, :d-1]).strftime('%Y-%m-%d %H:%M:%S').tolist()
-            input_candles = ohlc_windows[i, :d-1].tolist()
+            input_timestamps = context_df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
+            input_candles = context_df[['open', 'high', 'low', 'close']].values.tolist()
 
             predictions.append({
                 'timestamp': ts,
@@ -210,7 +207,7 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
     return pd.DataFrame(predictions)
 
 def printaccuracy(predictions_df):
-    """Generates HTML report and structured data dictionary."""
+    """Generates HTML report."""
     if predictions_df.empty:
         return "<h3>No predictions made (adjust E or C)</h3>", {"error": "No predictions"}
 
@@ -225,7 +222,6 @@ def printaccuracy(predictions_df):
     active['pnl'] = active['predicted_dir'] * active['actual_ret']
     active['cum_pnl'] = active['pnl'].cumsum()
     
-    # Plot
     plt.figure(figsize=(10, 5))
     plt.plot(active['timestamp'], active['cum_pnl'], label='Cumulative PnL')
     plt.title(f'Strategy Performance (Acc: {accuracy:.2f}%)')
@@ -238,7 +234,6 @@ def printaccuracy(predictions_df):
     plot_url = base64.b64encode(img.getvalue()).decode()
     plt.close()
     
-    # HTML Table
     table_html = """
     <table border="1">
     <tr><th>Entry Time</th><th>Pred</th><th>Entry Price</th><th>Exit Price</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th><th>Input Context</th></tr>
@@ -259,7 +254,6 @@ def printaccuracy(predictions_df):
     
     html_out = f"<h3>Accuracy: {accuracy:.2f}% ({correct}/{total})</h3><img src='data:image/png;base64,{plot_url}'/><br>{table_html}"
 
-    # Stats Data
     active_clean = active.where(pd.notnull(active), None)
     equity_curve = active_clean[['timestamp', 'cum_pnl']].copy()
     equity_curve['timestamp'] = equity_curve['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -289,12 +283,11 @@ def get_seconds_to_sleep(timeframe):
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     unit = timeframe[-1]
     val = int(timeframe[:-1])
-    
     if unit == 'm': delta = timedelta(minutes=val)
     elif unit == 'h': delta = timedelta(hours=val)
     elif unit == 'd': delta = timedelta(days=val)
     else: delta = timedelta(hours=1)
-
+    
     if unit == 'h':
         next_hour = now.replace(minute=0, second=0, microsecond=0) + delta
         while next_hour < now: next_hour += delta
@@ -305,9 +298,7 @@ def get_seconds_to_sleep(timeframe):
         target = next_min
     else:
         target = now + delta
-
-    seconds = (target - now).total_seconds() + 5 
-    return max(0, seconds)
+    return max(0, (target - now).total_seconds() + 5)
 
 def live_loop():
     global live_outcomes
@@ -327,19 +318,14 @@ def live_loop():
             cols = ['open', 'high', 'low', 'close', 'volume']
             df_live[cols] = df_live[cols].astype(float)
             
-            # Unified derivation
             df_derived = deriveround(df_live)
             
             # Step 1: Resolve previous prediction
             if len(live_outcomes) > 0 and 'outcome' not in live_outcomes[-1]:
                 last_pred = live_outcomes[-1]
-                
-                # We need at least 2 candles to have a valid return at index -1
                 if len(df_derived) >= 2:
-                    # Index -1 is the just-closed candle (Outcome)
                     exit_price = df_live.iloc[-1]['close']
                     entry_price = last_pred.get('entry_price', exit_price)
-                    
                     raw_return = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
                     actual_dir = 1 if raw_return > 0 else -1
                     if raw_return == 0: actual_dir = 0
@@ -356,14 +342,15 @@ def live_loop():
             
             # Step 2: Make NEW prediction
             if len(df_derived) >= D:
-                # Context is the last D-1 candles (Indices: -(D-1) to End)
+                # Use Explicit Indexing here too
                 context_slice = df_derived.iloc[-(D-1):]
                 
-                # Returns for matching
-                recent_context_ret = context_slice[['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
+                # Math
+                # Explicit copy to numpy to avoid stride issues
+                recent_context_ret = context_slice[['open_ret', 'high_ret', 'low_ret', 'close_ret']].values.copy()
                 recent_context_flat = recent_context_ret.reshape(-1)
                 
-                # OHLC for logs
+                # Data (Explicit DF Lookup)
                 input_rows = df_live.loc[context_slice.index]
                 input_timestamps = input_rows['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
                 input_candles = input_rows[['open', 'high', 'low', 'close']].values.tolist()
@@ -374,7 +361,6 @@ def live_loop():
                 diff = np.abs(model_context_flat - recent_context_flat)
                 matches_idx = np.where(np.all(diff < E, axis=1))[0]
                 
-                # Entry price is the CLOSE of the last candle we just saw
                 entry_price = df_live.iloc[-1]['close']
                 
                 if len(matches_idx) > 0:
@@ -466,6 +452,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         <meta http-equiv="refresh" content="30">
         </head><body>
         <h1>Market Pattern Matcher: {SYMBOL} {TIMEFRAME}</h1>
+        <p><strong>System Status: Online</strong></p>
         <p>API Endpoints: <a href="/api/current">/api/current</a>, <a href="/api/live">/api/live</a>, <a href="/api/backtest">/api/backtest</a>, <a href="/api/recent">/api/recent</a></p>
         <hr>
         {results_html}
@@ -511,19 +498,9 @@ def main():
     recent_end = now_utc.isoformat()
     df_recent = fetch(TIMEFRAME, SYMBOL, recent_start, recent_end)
     
-    # <<< DEBUG START: Print Last 5 Candles of Recent History >>>
-    print("\n--- DEBUG: Recent Data Tail (Just fetched) ---")
+    print("\n--- SANITY CHECK: Recent Data Tail ---")
     print(df_recent.tail(5).to_string())
-    print("----------------------------------------------\n")
-    
-    # Generate Debug HTML Table for Website
-    debug_recent_html = "<h3>Debug: Raw Data (Last 5 Fetched for Recent)</h3>"
-    debug_recent_html += "<table border='1'><tr><th>Timestamp</th><th>Open</th><th>High</th><th>Low</th><th>Close</th></tr>"
-    for _, row in df_recent.tail(5).iterrows():
-        ts_str = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(row['timestamp'], pd.Timestamp) else str(row['timestamp'])
-        debug_recent_html += f"<tr><td>{ts_str}</td><td>{row['open']}</td><td>{row['high']}</td><td>{row['low']}</td><td>{row['close']}</td></tr>"
-    debug_recent_html += "</table>"
-    # <<< DEBUG END >>>
+    print("--------------------------------------\n")
     
     df_recent = deriveround(df_recent)
     preds_recent = predict_on_recent(model_sequences, df_recent, E, D)
@@ -534,7 +511,7 @@ def main():
     {html_split2}
     <hr>
     <h2>Recent 14 Days Performance</h2>
-    {debug_recent_html} {html_recent}
+    {html_recent}
     """
     
     # 6. Launch
