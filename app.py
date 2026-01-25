@@ -14,15 +14,18 @@ from collections import Counter, defaultdict
 import json
 
 # ---------------------------------------------------------
-# 7. All parameters defined at the top
+# 7. Parameters
 # ---------------------------------------------------------
-SYMBOL = 'SHIBUSDT'   # Changed to SHIB to demonstrate robustness
+SYMBOL = 'SHIBUSDT'
 INTERVAL = '1h'
-START_TIME = '2024-01-01' # Adjusted for SHIB data availability/relevance
+START_TIME = '2024-01-01'
 END_TIME = '2026-01-01'
 PORT = 8080
-GRID_PERCENT = 0.01  # 1%
 TRAIN_SPLIT_RATIO = 0.7
+
+# Grid Search Parameters
+# Search from 0.1% to 5% grid sizes
+GRID_SEARCH_VALUES = [0.001, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]
 
 # ---------------------------------------------------------
 # 1. Fetch 1h ohlc from binance
@@ -79,31 +82,51 @@ def fetch_binance_data(symbol, interval, start_str, end_str):
     return df[['open_time', 'close']]
 
 # ---------------------------------------------------------
-# Processing & Backtesting Logic
+# Helper: Sharpe Calculation
 # ---------------------------------------------------------
-def run_backtest(df):
-    # 2. Round close to 1% * first close
+def calculate_sharpe_ratio(returns_series, periods_per_year=24*365):
+    """
+    Calculates Annualized Sharpe Ratio.
+    Assumes Risk Free Rate = 0 for simplicity in crypto context.
+    """
+    if len(returns_series) < 2:
+        return 0.0
+    
+    mean_ret = np.mean(returns_series)
+    std_ret = np.std(returns_series)
+    
+    if std_ret == 0:
+        return 0.0
+        
+    # Annualize
+    sharpe = (mean_ret / std_ret) * np.sqrt(periods_per_year)
+    return sharpe
+
+# ---------------------------------------------------------
+# Processing & Backtesting Logic (Refactored for Loop)
+# ---------------------------------------------------------
+def evaluate_strategy(df_original, grid_percent, verbose=False):
+    """
+    Runs the strategy for a specific grid_percent.
+    Returns metrics needed for optimization and reporting.
+    """
+    # Work on a copy to avoid SettingWithCopy warnings on the main df
+    df = df_original.copy()
+    
     first_close = df['close'].iloc[0]
-    grid_size = first_close * GRID_PERCENT
+    grid_size = first_close * grid_percent
     
     # --- DYNAMIC PRECISION LOGIC ---
-    # Log10 gives us the magnitude (e.g., 0.01 -> -2, 0.0001 -> -4)
-    # We take the ceiling of the negative log to get decimal places needed.
-    # We add 2 extra digits of safety to prevent float artifacts.
     if grid_size == 0:
         needed_precision = 8
     else:
         needed_precision = int(math.ceil(-math.log10(grid_size))) + 2
-    
-    # Cap precision to avoid excessive length (Binance max is usually 8)
     needed_precision = max(2, min(needed_precision, 10))
     
-    print(f"First Close: {first_close}")
-    print(f"Grid Size (1%): {grid_size:.{needed_precision}f}")
-    print(f"Dynamic Precision set to: {needed_precision} decimals")
+    if verbose:
+        print(f"Grid: {grid_percent*100}% | Size: {grid_size} | Precision: {needed_precision}")
 
-    # Rounding logic: round(value / step) * step
-    # We round the FINAL result to 'needed_precision' to clean artifacts
+    # Rounding logic
     df['rounded_close'] = ((df['close'] / grid_size).round() * grid_size).round(needed_precision)
     
     # Prepare Targets
@@ -128,14 +151,12 @@ def run_backtest(df):
     
     data = df.dropna().copy()
     
-    # 3. Split train/test
+    # Split train/test
     split_idx = int(len(data) * TRAIN_SPLIT_RATIO)
     train_df = data.iloc[:split_idx]
     test_df = data.iloc[split_idx:]
     
-    print(f"Training samples: {len(train_df)}, Test samples: {len(test_df)}")
-    
-    # 4. Train
+    # Train
     sequence_map = defaultdict(list)
     for _, row in train_df.iterrows():
         seq = (row['t_2'], row['t_1'], row['t_0'])
@@ -147,13 +168,13 @@ def run_backtest(df):
         most_common = counts.most_common(1)[0][0]
         model[seq] = most_common
         
-    # 5. Test
-    results = []
+    # Test
     correct_predictions = 0
     total_predictions = 0
     cumulative_pnl = 0.0
     
     test_results_list = []
+    hourly_returns = []
     
     for idx, row in test_df.iterrows():
         seq = (row['t_2'], row['t_1'], row['t_0'])
@@ -169,12 +190,19 @@ def run_backtest(df):
         next_price = row['next_close_raw']
         
         trade_pnl = 0.0
+        
+        # Calculate PnL
         if prediction == 'UP':
             trade_pnl = next_price - curr_price
         elif prediction == 'DOWN':
             trade_pnl = curr_price - next_price
             
         cumulative_pnl += trade_pnl
+        
+        # Calculate Percentage Return for Sharpe (PnL / Investment)
+        # Investment is effectively the current price (assuming 1 unit)
+        pct_return = trade_pnl / curr_price if curr_price > 0 else 0
+        hourly_returns.append(pct_return)
         
         test_results_list.append({
             'time_t': row['open_time'],
@@ -192,18 +220,54 @@ def run_backtest(df):
         })
         
     accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
+    sharpe = calculate_sharpe_ratio(hourly_returns)
     
-    print(f"Accuracy: {accuracy:.2f}%")
-    print(f"Total PnL: {cumulative_pnl:.8f}")
+    return {
+        'sharpe': sharpe,
+        'accuracy': accuracy,
+        'cumulative_pnl': cumulative_pnl,
+        'grid_size': grid_size,
+        'needed_precision': needed_precision,
+        'test_results': test_results_list,
+        'grid_percent': grid_percent
+    }
+
+# ---------------------------------------------------------
+# Grid Search Driver
+# ---------------------------------------------------------
+def run_grid_search(df):
+    print(f"\n--- Starting Grid Search for Sharpe Optimization ---")
+    print(f"Values to test: {GRID_SEARCH_VALUES}")
     
-    return train_df, test_df, test_results_list, accuracy, cumulative_pnl, grid_size, needed_precision
+    best_sharpe = -float('inf')
+    best_result = None
+    
+    results_summary = []
+    
+    for gp in GRID_SEARCH_VALUES:
+        res = evaluate_strategy(df, gp, verbose=False)
+        
+        print(f"Grid: {gp*100:5.2f}% | Sharpe: {res['sharpe']:6.3f} | Acc: {res['accuracy']:5.2f}% | PnL: {res['cumulative_pnl']:8.4f}")
+        
+        results_summary.append((gp, res['sharpe']))
+        
+        if res['sharpe'] > best_sharpe:
+            best_sharpe = res['sharpe']
+            best_result = res
+            
+    print("-" * 60)
+    print(f"Best Grid Percent: {best_result['grid_percent']*100}% with Sharpe: {best_result['sharpe']:.4f}")
+    return best_result
 
 # ---------------------------------------------------------
 # 6. Serve plot and table
 # ---------------------------------------------------------
-def create_plot(df, test_results, accuracy, total_pnl):
+def create_plot(df, test_results, accuracy, total_pnl, symbol, grid_percent):
     plt.figure(figsize=(12, 6))
     plt.plot(df['open_time'], df['close'], label='Price', color='gray', alpha=0.3)
+    
+    # Filter df to match test_results timeframe for alignment if needed, 
+    # but strictly we just plot the PnL curve overlay
     
     test_times = [x['time_t'] for x in test_results]
     test_pnl = [x['cum_pnl'] for x in test_results]
@@ -214,7 +278,7 @@ def create_plot(df, test_results, accuracy, total_pnl):
     
     ax1.set_ylabel('Price (USDT)')
     ax2.set_ylabel('Cumulative PnL (USDT)')
-    plt.title(f'Backtest: {SYMBOL} | Acc: {accuracy:.2f}% | PnL: {total_pnl:.6f}')
+    plt.title(f'Optimized Backtest: {symbol} (Grid={grid_percent*100}%) | Acc: {accuracy:.2f}% | PnL: {total_pnl:.6f}')
     
     buf = io.BytesIO()
     plt.savefig(buf, format='png')
@@ -241,17 +305,19 @@ HTML_TEMPLATE = """
         .down {{ color: red; font-weight: bold; }}
         .stats {{ background: #f4f4f4; padding: 15px; border-radius: 4px; margin-bottom: 20px; }}
         .raw-price {{ color: #666; font-style: italic; }}
+        .highlight {{ color: #007bff; font-weight: bold; }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h2>Backtest Report: {symbol}</h2>
+        <h2>Optimized Backtest Report: {symbol}</h2>
         
         <div class="stats">
             <strong>Interval:</strong> {interval} | 
             <strong>Start:</strong> {start} | 
-            <strong>End:</strong> {end} |
-            <strong>Grid Size:</strong> {grid_size} <br>
+            <strong>End:</strong> {end} <br>
+            <strong>Optimized Grid:</strong> <span class="highlight">{grid_percent:.2f}%</span> (Size: {grid_size}) <br>
+            <strong>Sharpe Ratio:</strong> <span class="highlight">{sharpe:.4f}</span> |
             <strong>Accuracy:</strong> {accuracy:.2f}% | 
             <strong>Total PnL:</strong> {pnl} USDT
         </div>
@@ -285,7 +351,7 @@ HTML_TEMPLATE = """
         const data = {json_data};
         const rowsPerPage = 50;
         let currentPage = 1;
-        const precision = {precision}; // Passed from Python
+        const precision = {precision}; 
 
         function renderTable() {{
             const tbody = document.getElementById('tableBody');
@@ -302,8 +368,7 @@ HTML_TEMPLATE = """
                 const actualClass = row.actual === 'UP' ? 'up' : (row.actual === 'DOWN' ? 'down' : '');
                 const pnlColor = row.pnl >= 0 ? 'green' : 'red';
                 
-                // Use the calculated precision for display
-                const rawP = precision + 1; // Show slightly more for raw
+                const rawP = precision + 2; 
                 
                 tr.innerHTML = `
                     <td>${{row.time_t}}</td>
@@ -341,11 +406,20 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# Global placeholders for the server
+global_best_result = None
+global_plot_b64 = None
+
 class BacktestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
+        
+        # Unpack global results
+        res = global_best_result
+        test_results = res['test_results']
+        needed_precision = res['needed_precision']
         
         js_data = []
         for r in test_results:
@@ -365,9 +439,8 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
             
         json_str = json.dumps(js_data)
         
-        # Format grid size string based on precision
-        grid_fmt = f"{grid_size:.{needed_precision}f}"
-        pnl_fmt = f"{total_pnl:.{needed_precision}f}"
+        grid_fmt = f"{res['grid_size']:.{needed_precision}f}"
+        pnl_fmt = f"{res['cumulative_pnl']:.{needed_precision}f}"
         
         html_content = HTML_TEMPLATE.format(
             symbol=SYMBOL,
@@ -375,9 +448,11 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
             start=START_TIME,
             end=END_TIME,
             grid_size=grid_fmt,
-            accuracy=accuracy,
+            grid_percent=res['grid_percent']*100,
+            sharpe=res['sharpe'],
+            accuracy=res['accuracy'],
             pnl=pnl_fmt,
-            plot_data=plot_b64,
+            plot_data=global_plot_b64,
             json_data=json_str,
             precision=needed_precision
         )
@@ -388,16 +463,27 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
 # Execution
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    df = fetch_binance_data(SYMBOL, INTERVAL, START_TIME, END_TIME)
+    df_main = fetch_binance_data(SYMBOL, INTERVAL, START_TIME, END_TIME)
     
-    if df.empty:
+    if df_main.empty:
         print("No data fetched. Exiting.")
         sys.exit(1)
         
-    train_df, test_df, test_results, accuracy, total_pnl, grid_size, needed_precision = run_backtest(df)
+    # Run Grid Search
+    best_result = run_grid_search(df_main)
     
-    print("Generating plot...")
-    plot_b64 = create_plot(df, test_results, accuracy, total_pnl)
+    # Store in global variables for the request handler
+    global_best_result = best_result
+    
+    print("Generating plot for best result...")
+    global_plot_b64 = create_plot(
+        df_main, 
+        best_result['test_results'], 
+        best_result['accuracy'], 
+        best_result['cumulative_pnl'],
+        SYMBOL,
+        best_result['grid_percent']
+    )
     
     print(f"Starting server on port {PORT}...")
     print(f"Open your browser at http://localhost:{PORT}")
