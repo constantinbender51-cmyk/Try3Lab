@@ -29,7 +29,6 @@ E = float(os.environ.get('E', 0.002))        # Similarity threshold
 
 # Global State
 results_html = "<h1>Initializing...</h1>"
-debug_html = "<p>Waiting for data...</p>"  # New global for debug table
 live_outcomes = []
 model_sequences = None
 data_global = None
@@ -311,7 +310,7 @@ def get_seconds_to_sleep(timeframe):
     return max(0, seconds)
 
 def live_loop():
-    global live_outcomes, debug_html
+    global live_outcomes
     while True:
         try:
             sec = get_seconds_to_sleep(TIMEFRAME)
@@ -327,22 +326,6 @@ def live_loop():
             df_live['timestamp'] = pd.to_datetime(df_live['timestamp'], unit='ms')
             cols = ['open', 'high', 'low', 'close', 'volume']
             df_live[cols] = df_live[cols].astype(float)
-            
-            # --- DEBUG: Generate HTML for Last 5 Candles ---
-            last_5 = df_live.tail(5).copy()
-            last_5['timestamp'] = last_5['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Print to Console for verification
-            print("\n--- DEBUG: RAW DATA TAIL ---")
-            print(last_5.to_string())
-            print("----------------------------\n")
-            
-            # Create HTML Table
-            debug_html = "<h3>Debug: Raw Data (Last 5 Candles)</h3>"
-            debug_html += "<table border='1'><tr><th>Timestamp</th><th>Open</th><th>High</th><th>Low</th><th>Close</th></tr>"
-            for _, row in last_5.iterrows():
-                debug_html += f"<tr><td>{row['timestamp']}</td><td>{row['open']:.2f}</td><td>{row['high']:.2f}</td><td>{row['low']:.2f}</td><td>{row['close']:.2f}</td></tr>"
-            debug_html += "</table>"
             
             # Unified derivation
             df_derived = deriveround(df_live)
@@ -440,7 +423,7 @@ class CustomJSONEncoder(json.JSONEncoder):
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        global results_html, live_outcomes, backtest_data, recent_data, debug_html
+        global results_html, live_outcomes, backtest_data, recent_data
         
         if self.path == '/api/current':
             self.send_json(live_outcomes[-1] if live_outcomes else {"status": "waiting"})
@@ -485,8 +468,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         <h1>Market Pattern Matcher: {SYMBOL} {TIMEFRAME}</h1>
         <p>API Endpoints: <a href="/api/current">/api/current</a>, <a href="/api/live">/api/live</a>, <a href="/api/backtest">/api/backtest</a>, <a href="/api/recent">/api/recent</a></p>
         <hr>
-        {debug_html}
-        <hr>
         {results_html}
         <hr>
         {live_html}
@@ -529,6 +510,21 @@ def main():
     recent_start = (now_utc - timedelta(days=14)).isoformat()
     recent_end = now_utc.isoformat()
     df_recent = fetch(TIMEFRAME, SYMBOL, recent_start, recent_end)
+    
+    # <<< DEBUG START: Print Last 5 Candles of Recent History >>>
+    print("\n--- DEBUG: Recent Data Tail (Just fetched) ---")
+    print(df_recent.tail(5).to_string())
+    print("----------------------------------------------\n")
+    
+    # Generate Debug HTML Table for Website
+    debug_recent_html = "<h3>Debug: Raw Data (Last 5 Fetched for Recent)</h3>"
+    debug_recent_html += "<table border='1'><tr><th>Timestamp</th><th>Open</th><th>High</th><th>Low</th><th>Close</th></tr>"
+    for _, row in df_recent.tail(5).iterrows():
+        ts_str = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(row['timestamp'], pd.Timestamp) else str(row['timestamp'])
+        debug_recent_html += f"<tr><td>{ts_str}</td><td>{row['open']}</td><td>{row['high']}</td><td>{row['low']}</td><td>{row['close']}</td></tr>"
+    debug_recent_html += "</table>"
+    # <<< DEBUG END >>>
+    
     df_recent = deriveround(df_recent)
     preds_recent = predict_on_recent(model_sequences, df_recent, E, D)
     html_recent, recent_data = printaccuracy(preds_recent)
@@ -538,7 +534,7 @@ def main():
     {html_split2}
     <hr>
     <h2>Recent 14 Days Performance</h2>
-    {html_recent}
+    {debug_recent_html} {html_recent}
     """
     
     # 6. Launch
