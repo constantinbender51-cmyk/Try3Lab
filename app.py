@@ -27,10 +27,10 @@ def ensure_dir(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
 
-def fetch_data():
+def fetch_and_prepare_data():
     ensure_dir(DATA_DIR)
     
-    # Force delete to ensure fresh data alignment
+    # 1. Force Clean Slate: Remove old file to ensure fresh fetch
     if os.path.exists(DATA_FILE):
         os.remove(DATA_FILE)
     
@@ -42,6 +42,7 @@ def fetch_data():
     
     all_candles = []
     
+    # --- A. FETCH RAW DATA ---
     while since < end_ts:
         try:
             ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
@@ -60,45 +61,43 @@ def fetch_data():
             print(f"Error fetching data: {e}")
             break
 
+    # 2. Create DataFrame and Set Timestamp as Index
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    
+    # !!! CRITICAL: Set Index to Timestamp. All subsequent column additions align to this. !!!
     df.set_index('timestamp', inplace=True)
     
-    # Strict filtering and sorting
+    # Filter strictly within range
     df = df.sort_index()
-    df = df[~df.index.duplicated(keep='first')]
     mask = (df.index >= pd.Timestamp(START_DATE)) & (df.index < pd.Timestamp(END_DATE))
     df = df.loc[mask]
     
-    df.to_csv(DATA_FILE)
-    print(f"Data fetched and saved: {len(df)} rows.")
-    return df
+    if df.empty:
+        return df
 
-def prepare_single_df(df):
-    """
-    Creates a single DataFrame containing Raw, Normalized, and Derivative data.
-    Ensures all columns have the same length (aligned by index).
-    """
-    # 1. Raw Data is already in 'df' (open, high, low, close)
-    
-    # 2. Add Derivative Columns (fill NaN at index 0 to maintain length)
+    # --- B. ADD DERIVATIVE COLUMNS (Aligned by Timestamp) ---
+    # pct_change() calculates change from t-1 to t. The result is placed at index t.
     deriv_cols = ['d_open', 'd_high', 'd_low', 'd_close']
     for col in ['open', 'high', 'low', 'close']:
-        # pct_change() puts NaN in the first row. We fill with 0 to keep the row count identical.
         df[f'd_{col}'] = df[col].pct_change().fillna(0)
 
-    # 3. Add Normalized Columns
-    # We normalize against the very first entry of the loaded dataset
-    if len(df) > 0:
-        first_vals = df.iloc[0]
-        norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
-        for col, n_col in zip(['open', 'high', 'low', 'close'], norm_cols):
-            df[n_col] = df[col] / first_vals[col]
+    # --- C. ADD NORMALIZED COLUMNS (Aligned by Timestamp) ---
+    # Normalize everything relative to the very first candle in this dataset
+    first_vals = df.iloc[0]
+    norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
+    for col, n_col in zip(['open', 'high', 'low', 'close'], norm_cols):
+        df[n_col] = df[col] / first_vals[col]
 
-        # 4. Rounding (Only apply to Derivative and Normalized columns)
-        cols_to_round = deriv_cols + norm_cols
-        df[cols_to_round] = (df[cols_to_round] / ROUNDING_STEP).round() * ROUNDING_STEP
+    # --- D. APPLY ROUNDING ---
+    # Rounding applies to the derivative and normalized columns we just created
+    cols_to_round = deriv_cols + norm_cols
+    df[cols_to_round] = (df[cols_to_round] / ROUNDING_STEP).round() * ROUNDING_STEP
 
+    # Save the Unified DataFrame
+    df.to_csv(DATA_FILE)
+    print(f"Unified Data Saved: {len(df)} rows.")
+    
     return df
 
 def train_model(train_df, input_cols):
@@ -106,7 +105,6 @@ def train_model(train_df, input_cols):
     data_values = train_df[input_cols].values
     train_outcomes = (train_df['close'].shift(-1) - train_df['close']) / train_df['close']
     
-    # Stop before the last row because we need outcome (i+1)
     for i in range(SEQ_LEN - 1, len(train_df) - 1):
         seq_array = data_values[i-SEQ_LEN+1 : i+1] 
         seq = tuple(seq_array.flatten()) 
@@ -332,30 +330,30 @@ def format_recent_data(df):
 report_data = {}
 
 def main_logic():
-    # 1. Fetch Raw
-    raw_df = fetch_data()
-    if raw_df.empty: 
+    # 1. Fetch, Prepare, and Unify Data
+    df = fetch_and_prepare_data()
+    if df.empty: 
         print("Error: No data fetched.")
         return
 
-    # 2. Prepare Single Unified Dataframe (Raw + Norm + Deriv)
-    df = prepare_single_df(raw_df)
+    # 2. PRINT First and Last 10 Entries for verification
+    # We display index (timestamp), raw close, norm close, and deriv close
+    print("\n" + "="*80)
+    print(f" UNIFIED DATAFRAME CHECK (Index=Timestamp) for {SYMBOL}")
+    print("="*80)
     
-    # 3. PRINT First and Last 10 Entries as requested
-    print("\n" + "="*50)
-    print(" UNIFIED DATAFRAME: FIRST 10 ENTRIES ")
-    print("="*50)
-    # Select a subset of columns to make the print readable
-    cols_to_print = ['open', 'close', 'n_close', 'd_close']
-    print(df[cols_to_print].head(10))
+    # Selecting specific columns to keep print output clean but informative
+    # Note: 'timestamp' is the Index, so it prints automatically on the left.
+    cols_check = ['open', 'close', 'n_close', 'd_close']
     
-    print("\n" + "="*50)
-    print(" UNIFIED DATAFRAME: LAST 10 ENTRIES ")
-    print("="*50)
-    print(df[cols_to_print].tail(10))
-    print("="*50 + "\n")
+    print("\n--- FIRST 10 ENTRIES ---")
+    print(df[cols_check].head(10))
+    
+    print("\n--- LAST 10 ENTRIES ---")
+    print(df[cols_check].tail(10))
+    print("="*80 + "\n")
 
-    # 4. Use this single DF for Prediction
+    # 3. Use this SINGLE aligned dataframe for Prediction
     deriv_rules, norm_rules, test_df, top_seq = build_sequences_and_predict(df)
     results_df, stats, dates, pnl_curve = run_backtest(deriv_rules, norm_rules, test_df)
     
