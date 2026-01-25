@@ -3,7 +3,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for server usage
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import io
 import base64
@@ -13,66 +13,59 @@ from flask import Flask, render_template_string
 DATA_PATH = '/app/data/ohlc.csv'
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-LIMIT = 2000  # Number of candles to fetch
-THRESHOLD = 0.001  # Threshold for "0" direction (0.1% move)
-SPHERE_RADIUS = 0.05  # The radius of the fading sphere. Needs to be tuned to data scale.
+LIMIT = 2000
+THRESHOLD = 0.001
+SPHERE_RADIUS = 0.5  # Adjusted for normalized data
 PORT = 8080
+
+# --- Global Storage ---
+# We store the results here so the web page loads instantly
+RESULTS_CACHE = {
+    'accuracy': None,
+    'total_pnl': None,
+    'num_samples': 0,
+    'plot_pnl': None,
+    'plot_cm': None,
+    'table_html': None
+}
 
 app = Flask(__name__)
 
 # --- 1. Fetch & 2/3. Save/Load ---
 def get_ohlc_data():
-    # Ensure directory exists
     os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
-
     if os.path.exists(DATA_PATH):
-        print("Loading data from disk...")
-        df = pd.read_csv(DATA_PATH)
-    else:
-        print("Fetching data from Binance...")
-        exchange = ccxt.binance()
-        try:
-            ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LIMIT)
-            df = pd.DataFrame(ohlc, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df.to_csv(DATA_PATH, index=False)
-        except Exception as e:
-            return None, f"Error fetching data: {str(e)}"
+        print(f"Loading data from {DATA_PATH}...")
+        return pd.read_csv(DATA_PATH)
     
-    return df, None
+    print(f"Fetching {LIMIT} candles for {SYMBOL}...")
+    exchange = ccxt.binance()
+    ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LIMIT)
+    df = pd.DataFrame(ohlc, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df.to_csv(DATA_PATH, index=False)
+    return df
 
 # --- 4. Processing ---
 def process_data(df):
     raw_ohlc = df[['open', 'high', 'low', 'close']].values
-    
-    # Derivative OHLC (Change from previous candle)
-    # Assume first entry is 0 to match dimensions
+    # Derivative: Current - Previous. Prepend 0 to match size.
     derivative_ohlc = np.diff(raw_ohlc, axis=0, prepend=0)
-    
-    # We use derivative data for features to make them stationary (comparable over time)
-    # normalize derivative data for the "sphere" logic to work better
-    # Simple min-max or std scaling is usually needed for distance-based algos.
-    # However, to strictly follow "raw/derivative" without external scaler libraries, 
-    # we proceed with derivative_ohlc.
-    
     return raw_ohlc, derivative_ohlc
 
 # --- 6. Sequences & 7. Labeling ---
 def create_dataset(data, raw_close, seq_length=3):
     X = []
     y = []
-    y_raw_change = [] # To calc PnL later
+    y_raw_change = []
 
-    # We need 3 candles for X, and the 4th candle for y
     for i in range(len(data) - seq_length):
-        # Feature: Flatten 3 candles * 4 dims = 12 dims
+        # 12 Dimensions (3 candles * 4 features)
         seq = data[i:i+seq_length].flatten()
         X.append(seq)
         
-        # Target: 4th candle direction
-        # We compare Close of (i+seq_length) vs Close of (i+seq_length-1)
+        # Label logic based on 4th candle
         current_close = raw_close[i+seq_length-1]
         next_close = raw_close[i+seq_length]
-        
         change_pct = (next_close - current_close) / current_close
         y_raw_change.append(change_pct)
         
@@ -88,41 +81,30 @@ def create_dataset(data, raw_close, seq_length=3):
 
 # --- 8 & 9. The Painting Algorithm ---
 def infer_painting(X_train, y_train, X_test):
-    """
-    Implements the 13-dimensional painting logic.
-    """
-    # Construct the 13-dimensional Training Points
-    # X_train is (N, 12), y_train is (N,). We stack them to (N, 13)
+    print("Building 13D Painting and running inference...")
+    
+    # 13D Training Points: 12 features + 1 label dimension
     train_points_13d = np.hstack((X_train, y_train.reshape(-1, 1)))
     
     predictions = []
-    
-    # Possible directions for the 13th dimension
     candidates = [-1.0, 0.0, 1.0]
     
-    print(f"Running inference on {len(X_test)} points. This might take a moment...")
-    
-    # For every point in test set
+    # Vectorized inference could be optimized further, but sticking to loop for clarity of "Sphere" logic
     for i, x_t in enumerate(X_test):
-        best_intensity = -1
-        best_dir = 0
+        best_intensity = -1.0
+        best_dir = 0.0
         
-        # We test which "height" (direction) in the 13th dimension has the most "paint"
         for cand_dir in candidates:
-            # Construct the test point in 13D space with the hypothesis direction
+            # Hypothetical 13D point
             test_point_13d = np.append(x_t, cand_dir)
             
-            # Vectorized Euclidean distance calculation
-            # Dist between this test hypothesis and ALL training spheres
+            # Distance to all training spheres
             dists = np.linalg.norm(train_points_13d - test_point_13d, axis=1)
             
-            # Fading sphere function: 1 in middle, decreases to 0. 
-            # Logic: Intensity = max(0, 1 - (dist / RADIUS))
-            # If dist > RADIUS, intensity is 0.
-            
-            # We scale distance to make the radius effective.
+            # Fading sphere: Intensity = 1 at center, 0 at radius
             intensities = np.maximum(0, 1 - (dists / SPHERE_RADIUS))
             
+            # Sum of paint intensity for this hypothesis
             total_intensity = np.sum(intensities)
             
             if total_intensity > best_intensity:
@@ -131,159 +113,146 @@ def infer_painting(X_train, y_train, X_test):
         
         predictions.append(best_dir)
         
+        if i % 100 == 0:
+            print(f"Processed {i}/{len(X_test)} test points...")
+            
     return np.array(predictions)
 
-# --- Plotting Utility ---
-def create_plots(y_test, predictions, pnl_curve):
-    # Plot 1: PnL Curve
+# --- Plotting ---
+def generate_assets(y_test, preds, strategy_returns):
+    # PnL Plot
     fig1, ax1 = plt.subplots(figsize=(10, 5))
-    ax1.plot(np.cumsum(pnl_curve), label='Cumulative PnL (%)', color='green')
-    ax1.set_title('Strategy PnL over Test Set')
-    ax1.set_xlabel('Trade #')
-    ax1.set_ylabel('Return')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    cumulative = np.cumsum(strategy_returns) * 100
+    ax1.plot(cumulative, label='Cumulative PnL (%)', color='#00ff88')
+    ax1.set_facecolor('#1e1e1e')
+    fig1.patch.set_facecolor('#1e1e1e')
+    ax1.tick_params(colors='white')
+    ax1.xaxis.label.set_color('white')
+    ax1.yaxis.label.set_color('white')
+    ax1.set_title('Strategy Performance', color='white')
+    ax1.grid(True, alpha=0.1)
     
     img1 = io.BytesIO()
-    fig1.savefig(img1, format='png')
+    fig1.savefig(img1, format='png', bbox_inches='tight')
     img1.seek(0)
-    plot_url1 = base64.b64encode(img1.getvalue()).decode()
+    plot_pnl = base64.b64encode(img1.getvalue()).decode()
     plt.close(fig1)
-
-    # Plot 2: Confusion Matrix / Distribution
-    fig2, ax2 = plt.subplots(figsize=(6, 6))
-    # Simple scatter or bar chart of predictions vs actual
+    
+    # Confusion Matrix
     from sklearn.metrics import confusion_matrix
-    try:
-        cm = confusion_matrix(y_test, predictions, labels=[-1, 0, 1])
-        im = ax2.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-        ax2.figure.colorbar(im, ax=ax2)
-        ax2.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]),
-               xticklabels=[-1, 0, 1], yticklabels=[-1, 0, 1],
-               title='Confusion Matrix', ylabel='True Label', xlabel='Predicted Label')
-    except:
-        ax2.text(0.5, 0.5, "Insufficient data for Matrix", ha='center')
+    cm = confusion_matrix(y_test, preds, labels=[-1, 0, 1])
+    
+    fig2, ax2 = plt.subplots(figsize=(6, 6))
+    im = ax2.imshow(cm, interpolation='nearest', cmap='Blues')
+    ax2.set_title('Confusion Matrix')
+    # Label axes
+    ax2.set_xticks([0, 1, 2])
+    ax2.set_yticks([0, 1, 2])
+    ax2.set_xticklabels(['Short', 'Flat', 'Long'])
+    ax2.set_yticklabels(['Short', 'Flat', 'Long'])
+    
+    # Add text annotations
+    for i in range(3):
+        for j in range(3):
+            ax2.text(j, i, format(cm[i, j], 'd'),
+                     ha="center", va="center",
+                     color="white" if cm[i, j] > cm.max()/2 else "black")
     
     img2 = io.BytesIO()
-    fig2.savefig(img2, format='png')
+    fig2.savefig(img2, format='png', bbox_inches='tight')
     img2.seek(0)
-    plot_url2 = base64.b64encode(img2.getvalue()).decode()
+    plot_cm = base64.b64encode(img2.getvalue()).decode()
     plt.close(fig2)
-
-    return plot_url1, plot_url2
-
-# --- HTML Template ---
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>13D Painting Trading Strategy</title>
-    <style>
-        body { font-family: sans-serif; margin: 2rem; background: #f0f2f5; }
-        .container { max-width: 1000px; margin: 0 auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        h1 { color: #333; }
-        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 2rem; }
-        .stat-box { background: #f8f9fa; padding: 1rem; border-radius: 4px; text-align: center; border: 1px solid #dee2e6; }
-        .stat-val { font-size: 1.5rem; font-weight: bold; color: #007bff; }
-        .plots { display: flex; flex-wrap: wrap; gap: 2rem; justify-content: center; }
-        img { max-width: 100%; height: auto; border: 1px solid #ddd; }
-        table { width: 100%; border-collapse: collapse; margin-top: 2rem; }
-        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background-color: #f2f2f2; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>13-Dimensional "Sphere" Inference Results</h1>
-        
-        <div class="stats-grid">
-            <div class="stat-box">
-                <div>Accuracy</div>
-                <div class="stat-val">{{ accuracy }}%</div>
-            </div>
-            <div class="stat-box">
-                <div>Total PnL</div>
-                <div class="stat-val">{{ total_pnl }}%</div>
-            </div>
-            <div class="stat-box">
-                <div>Test Samples</div>
-                <div class="stat-val">{{ num_samples }}</div>
-            </div>
-        </div>
-
-        <div class="plots">
-            <div><img src="data:image/png;base64,{{ plot_pnl }}"></div>
-            <div><img src="data:image/png;base64,{{ plot_cm }}"></div>
-        </div>
-
-        <h3>Recent Trades (Last 20)</h3>
-        {{ table_html|safe }}
-    </div>
-</body>
-</html>
-"""
-
-# --- Main Route ---
-@app.route('/')
-def index():
-    # 1. Pipeline
-    df, err = get_ohlc_data()
-    if df is None:
-        return f"<h1>Error</h1><p>{err}</p>"
     
-    # 2. Preprocess
-    raw_ohlc, derivative_ohlc = process_data(df)
+    return plot_pnl, plot_cm
+
+# --- Initialization Pipeline ---
+def run_pipeline():
+    df = get_ohlc_data()
+    raw, derivative = process_data(df)
     
-    # 3. Create Sequences (Points in 12D)
-    # Using derivative_ohlc for features as raw prices don't work with distance metrics over time
-    X, y, y_raw_change = create_dataset(derivative_ohlc, df['close'].values, seq_length=3)
+    # Create sequences (3 candles = 12 dims)
+    X, y, y_raw_change = create_dataset(derivative, df['close'].values, seq_length=3)
     
-    # 4. Split 70/30
-    split_idx = int(len(X) * 0.70)
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
-    y_change_test = y_raw_change[split_idx:]
+    # Split 70/30
+    split = int(len(X) * 0.7)
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+    y_change_test = y_raw_change[split:]
     
-    # 5. Inference (The Painting)
-    # Normalize data for distance calculation logic (crude normalization based on train stats)
-    # This ensures the "Sphere Radius" is meaningful across different price scales
+    # Normalization (Crucial for Euclidean distance)
+    # We normalize based on Train stats only
     mean = np.mean(X_train, axis=0)
     std = np.std(X_train, axis=0) + 1e-8
-    
     X_train_norm = (X_train - mean) / std
     X_test_norm = (X_test - mean) / std
     
+    # Inference
     preds = infer_painting(X_train_norm, y_train, X_test_norm)
     
-    # 6. Calc Metrics
-    correct = (preds == y_test)
-    accuracy = np.mean(correct) * 100
-    
-    # PnL: If pred is 1, return is change. If -1, return is -change. If 0, 0.
-    # We use y_change_test (the actual % movement)
+    # Metrics
+    accuracy = np.mean(preds == y_test) * 100
     strategy_returns = preds * y_change_test
     total_pnl = np.sum(strategy_returns) * 100
     
-    # 7. Formatting for Web
-    # Create DataFrame for display
-    results_df = pd.DataFrame({
-        'Actual_Dir': y_test,
-        'Predicted_Dir': preds,
-        'Actual_Return': y_change_test,
-        'Strat_Return': strategy_returns
+    # Store results
+    plot_pnl, plot_cm = generate_assets(y_test, preds, strategy_returns)
+    
+    res_df = pd.DataFrame({
+        'Predicted': preds,
+        'Actual': y_test,
+        'Return': y_change_test,
+        'Strat_PnL': strategy_returns
     })
     
-    table_html = results_df.tail(20).to_html(classes='table', float_format=lambda x: '%.5f' % x)
-    plot_pnl, plot_cm = create_plots(y_test, preds, strategy_returns)
+    RESULTS_CACHE['accuracy'] = f"{accuracy:.2f}"
+    RESULTS_CACHE['total_pnl'] = f"{total_pnl:.2f}"
+    RESULTS_CACHE['num_samples'] = len(X_test)
+    RESULTS_CACHE['plot_pnl'] = plot_pnl
+    RESULTS_CACHE['plot_cm'] = plot_cm
+    RESULTS_CACHE['table_html'] = res_df.tail(20).to_html(classes='table', index=False)
     
-    return render_template_string(HTML_TEMPLATE, 
-                                  accuracy=f"{accuracy:.2f}", 
-                                  total_pnl=f"{total_pnl:.2f}",
-                                  num_samples=len(X_test),
-                                  plot_pnl=plot_pnl,
-                                  plot_cm=plot_cm,
-                                  table_html=table_html)
+    print("Pipeline complete. Server ready.")
+
+# --- Web Server ---
+HTML = """
+<!DOCTYPE html>
+<head>
+<style>
+    body { font-family: monospace; background: #121212; color: #e0e0e0; padding: 20px; }
+    .card { background: #1e1e1e; padding: 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    h1 { color: #00ff88; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; border-bottom: 1px solid #333; color: #888; }
+    td { padding: 8px 0; border-bottom: 1px solid #222; }
+    img { max-width: 100%; border-radius: 4px; }
+</style>
+</head>
+<body>
+    <h1>13-Dimensional Sphere Backtest</h1>
+    <div class="card">
+        <h2>Metrics</h2>
+        <p>Accuracy: <b>{{ r.accuracy }}%</b> | Total PnL: <b>{{ r.total_pnl }}%</b> | Samples: {{ r.num_samples }}</p>
+    </div>
+    <div class="grid">
+        <div class="card"><img src="data:image/png;base64,{{ r.plot_pnl }}"></div>
+        <div class="card"><img src="data:image/png;base64,{{ r.plot_cm }}"></div>
+    </div>
+    <div class="card">
+        <h3>Recent Classification Logs</h3>
+        {{ r.table_html|safe }}
+    </div>
+</body>
+"""
+
+@app.route('/')
+def index():
+    if RESULTS_CACHE['accuracy'] is None:
+        return "System initializing... please refresh in a moment."
+    return render_template_string(HTML, r=RESULTS_CACHE)
 
 if __name__ == '__main__':
-    print(f"Starting server on port {PORT}...")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    # Run the heavy pipeline once at startup
+    run_pipeline()
+    app.run(host='0.0.0.0', port=PORT)
