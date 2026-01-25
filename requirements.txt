@@ -1,5 +1,5 @@
-sklearn
-requests 
+scikit-learn
+requests
 ccxt
 pandas
 numpy
