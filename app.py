@@ -71,49 +71,44 @@ def build_sequences_and_predict(df):
     test_df = df.iloc[split_idx:].copy()
 
     # 7. Count outcome of every sequence
-    # Pattern logic: We will use the DERIVATIVE columns of the 'close' price for the sequence pattern.
-    # Using normalized raw prices for pattern matching is usually ineffective as price levels shift.
     pattern_map = {}
 
-    # Build Training Dictionary
-    # We iterate through the training data to build the "Knowledge Base"
-    # Sequence is based on the 'd_close' of previous 3 candles
-    values = train_df['d_close'].values
+    # We extract the derivative columns as a numpy array for speed/slicing
+    # Columns: d_open, d_high, d_low, d_close
+    d_data = train_df[['d_open', 'd_high', 'd_low', 'd_close']].values
     
-    # We need to look ahead to determine outcome
-    # Outcome is based on the NEXT candle (open to close change) relative to threshold
-    # However, prompt asks for next CLOSE rises/falls/stays. 
-    # Usually this is (Close_next - Close_current) / Close_current
-    
-    # Pre-calculate next return for labeling
-    # We use unrounded values for accurate labeling, but grouped by rounded sequences
+    # Calculate returns for labeling (Close to Close change of the NEXT candle)
+    # Using raw close prices for accuracy
     train_outcomes = (train_df['close'].shift(-1) - train_df['close']) / train_df['close']
     
-    print("Training model...")
-    for i in range(SEQ_LEN, len(train_df) - 1):
-        # Sequence: last 3 derivative closes
-        seq = tuple(values[i-SEQ_LEN+1:i+1]) # Tuple is hashable
+    print("Training model on OHLC sequences...")
+    # Iterate through training data
+    # i represents the index of the 'current' candle (end of sequence)
+    for i in range(SEQ_LEN - 1, len(train_df) - 1):
+        # Sequence: last 3 candles of OHLC derivatives
+        # Slice is exclusive on upper bound, so i+1 includes row i
+        seq_array = d_data[i-SEQ_LEN+1 : i+1] 
+        seq = tuple(seq_array.flatten()) # Flatten 3x4 array to 1D tuple for hashing
         
         outcome_val = train_outcomes.iloc[i]
         
+        # Determine Label
         if outcome_val > THRESHOLD:
-            label = 'LONG'
+            label = 'UP'
         elif outcome_val < -THRESHOLD:
-            label = 'SHORT'
+            label = 'DOWN'
         else:
             label = 'FLAT'
             
         if seq not in pattern_map:
-            pattern_map[seq] = {'LONG': 0, 'SHORT': 0, 'FLAT': 0}
+            pattern_map[seq] = {'UP': 0, 'DOWN': 0, 'FLAT': 0}
         
         pattern_map[seq][label] += 1
 
-    # Convert counts to probabilities/predictions
-    # We pick the outcome with the highest count
+    # Convert counts to prediction rules (Winner takes all)
     prediction_rules = {}
     for seq, counts in pattern_map.items():
         best_outcome = max(counts, key=counts.get)
-        # Only predict if there's a clear winner (optional, but good for stability)
         prediction_rules[seq] = best_outcome
 
     return prediction_rules, test_df
@@ -121,12 +116,10 @@ def build_sequences_and_predict(df):
 def run_backtest(prediction_rules, test_df):
     results = []
     
-    values = test_df['d_close'].values
+    # Prepare test data arrays
+    d_data = test_df[['d_open', 'd_high', 'd_low', 'd_close']].values
     opens = test_df['open'].values
     closes = test_df['close'].values
-    
-    # 8. Take test sequences and predict outcome
-    # 9. Test accurate, pnl
     
     cumulative_pnl = 0.0
     wins = 0
@@ -138,32 +131,26 @@ def run_backtest(prediction_rules, test_df):
 
     print("Running backtest...")
     # Iterate test data
-    for i in range(SEQ_LEN, len(test_df) - 1):
-        seq = tuple(values[i-SEQ_LEN+1:i+1])
+    for i in range(SEQ_LEN - 1, len(test_df) - 1):
+        seq_array = d_data[i-SEQ_LEN+1 : i+1]
+        seq = tuple(seq_array.flatten())
         
         pred = prediction_rules.get(seq, 'FLAT') # Default to FLAT if unseen
         
-        # Calculate actual PnL for the next candle
-        # Prompt: "If we predict long we calculate pnl by (close-open)/open"
-        # This implies we enter at Open of next candle and exit at Close of next candle
-        
+        # Trade execution on NEXT candle
         entry_price = opens[i+1]
         exit_price = closes[i+1]
         
         trade_pnl = 0.0
         
-        if pred == 'LONG':
+        # Calculate PnL based on prediction
+        if pred == 'UP':
             trade_pnl = (exit_price - entry_price) / entry_price
-        elif pred == 'SHORT':
+        elif pred == 'DOWN':
             trade_pnl = -(exit_price - entry_price) / entry_price
         
         # Check accuracy (Directional)
-        actual_move = (exit_price - entry_price) / entry_price
-        is_correct = False
-        
-        if pred == 'LONG' and actual_move > THRESHOLD: is_correct = True
-        elif pred == 'SHORT' and actual_move < -THRESHOLD: is_correct = True
-        elif pred == 'FLAT' and abs(actual_move) <= THRESHOLD: is_correct = True
+        actual_move_pct = (exit_price - entry_price) / entry_price
         
         if pred != 'FLAT':
             cumulative_pnl += trade_pnl
@@ -176,9 +163,8 @@ def run_backtest(prediction_rules, test_df):
             
             results.append({
                 'timestamp': test_df.index[i+1],
-                'sequence': str(seq),
                 'prediction': pred,
-                'actual_move_pct': round(actual_move * 100, 2),
+                'actual_move_pct': round(actual_move_pct * 100, 2),
                 'pnl': round(trade_pnl * 100, 2),
                 'cum_pnl': round(cumulative_pnl * 100, 2)
             })
@@ -195,7 +181,7 @@ def generate_plot(dates, pnl_history):
     plt.figure(figsize=(10, 5))
     plt.plot(dates, pnl_history, label='Strategy PnL (Cumulative %)')
     plt.title(f'Backtest Results: ETH/USDT ({TIMEFRAME})')
-    plt.ylabel('PnL')
+    plt.ylabel('PnL (Decimal)')
     plt.xlabel('Date')
     plt.legend()
     plt.grid(True)
@@ -219,7 +205,10 @@ def main_logic():
     # Store for Flask
     report_data['stats'] = stats
     report_data['plot'] = plot_url
-    report_data['table'] = results_df.tail(20).to_html(classes='table table-striped', index=False)
+    if not results_df.empty:
+        report_data['table'] = results_df.tail(20).to_html(classes='table table-striped', index=False)
+    else:
+        report_data['table'] = "<p>No trades executed in test set.</p>"
 
 @app.route('/')
 def home():
@@ -234,7 +223,7 @@ def home():
         <style>body{{ padding: 20px; }}</style>
     </head>
     <body>
-        <h1>ETH/USDT 1H Prediction Results</h1>
+        <h1>ETH/USDT 1H OHLC Prediction</h1>
         <hr>
         <div class="row">
             <div class="col-md-4">
