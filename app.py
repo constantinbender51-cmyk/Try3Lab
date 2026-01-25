@@ -19,7 +19,7 @@ END_STR = None
 B_SPLIT = 0.70
 C_TOP = 0.20
 D_LEN = 4 
-E_SIM = 10000
+E_SIM = 1
 API_PORT = 8080
 
 # Global state
