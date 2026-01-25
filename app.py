@@ -19,7 +19,7 @@ END_STR = None
 B_SPLIT = 0.70
 C_TOP = 0.20
 D_LEN = 4 
-E_SIM = 0.5 # Note: The original 1 (100%) is very loose; usually 0.05-0.1 is standard, but kept as requested.
+E_SIM = 0.7 # Note: The original 1 (100%) is very loose; usually 0.05-0.1 is standard, but kept as requested.
 API_PORT = 8080
 
 # Global state
