@@ -14,12 +14,12 @@ from datetime import datetime, timedelta
 # --- Parameters ---
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-START_STR = '2023-01-01 00:00:00' 
+START_STR = '2026-01-01 00:00:00' 
 END_STR = None 
 B_SPLIT = 0.70
-C_TOP = 0.1
-D_LEN = 3
-E_SIM = 1 # Note: The original 1 (100%) is very loose; usually 0.05-0.1 is standard, but kept as requested.
+C_TOP = 0.20
+D_LEN = 4 
+E_SIM = 1 
 API_PORT = 8080
 
 # Global state
@@ -27,8 +27,8 @@ live_log = []
 current_prediction = {}
 backtest_results = []
 recent_perf_results = []
-model_patterns_seqs = np.array([]) # Storing as numpy array for speed
-model_patterns_meta = [] # Storing scores/indices
+model_patterns_seqs = np.array([]) 
+model_patterns_meta = [] 
 debug_logs = [] 
 raw_plot_url = ""
 derived_plot_url = ""
@@ -81,9 +81,6 @@ def fetch(timeframe, symbol, start_str, end_str):
                 break
                 
             all_data.extend(data)
-            
-            # Binance klines: [Open Time, Open, High, Low, Close, Vol, Close Time, ...]
-            # Use Close Time + 1ms for next start
             current_start = data[-1][6] + 1
             
             if data[-1][0] >= end_ts:
@@ -120,7 +117,6 @@ def deriveround(df):
         df_derived[f'{col}_pct'] = df[col].pct_change()
         derived_cols.append(f'{col}_pct')
     
-    # Replace infinite values with 0 and fill NaNs
     df_derived[derived_cols] = df_derived[derived_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
     return df_derived
 
@@ -130,95 +126,63 @@ def split(df, b):
     return df.iloc[:split_idx].reset_index(drop=True), df.iloc[split_idx:].reset_index(drop=True)
 
 def create_sequences(data, d):
-    """
-    Vectorized sequence creation.
-    Returns array of shape (N, d, 4)
-    """
     n_samples = len(data) - d + 1
     if n_samples <= 0:
         return np.array([])
     
-    # Using stride_tricks to create a sliding window view (memory efficient)
-    # data shape: (Rows, Features)
-    # Result shape: (n_samples, d, Features)
     window_shape = (n_samples, d, data.shape[1])
     window_strides = (data.strides[0], data.strides[0], data.strides[1])
     
     sequences = np.lib.stride_tricks.as_strided(
         data, shape=window_shape, strides=window_strides, writeable=False
     )
-    return sequences.copy() # Return a copy to ensure memory safety in threading
+    return sequences.copy()
 
 def gettop(train_df, c, d, e):
-    print("Mining top patterns (Vectorized)...")
+    print("Mining top patterns (Full N x N Vectorized)...")
     cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
-    # Convert to float32 for speed/memory if dataset is large
     data_values = train_df[cols].values.astype(np.float32)
     
-    # Create all sequences: Shape (N, D, 4)
     seq_arr = create_sequences(data_values, d)
     n = len(seq_arr)
     if n == 0: return [], np.array([])
     
-    # Limit scoring to recent history to save time, as per original logic
-    limit_n = min(n, 2000) 
-    start_idx = n - limit_n
+    # --- LIMIT REMOVED ---
+    # We now score ALL sequences against ALL sequences.
+    scores = np.zeros(n, dtype=int)
     
-    scores = np.zeros(limit_n, dtype=int)
+    print(f"Scoring all {n} sequences against full history (Total ops: {n}x{n})...")
     
-    print(f"Scoring last {limit_n} sequences against {n} historical sequences...")
-    
-    # --- Vectorized Scoring Loop ---
-    # Instead of Python loop matching seq vs seq, we compare 
-    # one sequence against the entire matrix at once.
-    
-    # Flatten sequences for easier comparison: (N, D*4)
     flat_seqs = seq_arr.reshape(n, -1)
     
-    # We only score the target slice
-    target_slice = flat_seqs[start_idx:]
-    
-    # Iterate through the targets we want to score
-    for i in range(limit_n):
-        if i % 100 == 0: print(f"Scoring {i}/{limit_n}", end='\r')
+    # Iterate through EVERY sequence
+    for i in range(n):
+        if i % 100 == 0: print(f"Scoring {i}/{n} ({(i/n)*100:.1f}%)", end='\r')
         
-        target_vec = target_slice[i] # Shape (features,)
-        
-        # Calculate Percentage Difference Vectorized
-        # diff = |(matrix - target) / target|
-        # Handle division by zero carefully
+        target_vec = flat_seqs[i] 
         
         with np.errstate(divide='ignore', invalid='ignore'):
-            # This creates a boolean matrix where match is True
-            # We want rows where ALL features match
-            
-            # Using a small epsilon for zero division protection
             safe_target = np.where(np.abs(target_vec) < 1e-9, 1e-9, target_vec)
             diffs = np.abs((flat_seqs - target_vec) / safe_target)
             
-            # If target was effectively zero, check absolute difference instead of relative
-            # (Hybrid approach for stability)
             zero_mask = (np.abs(target_vec) < 1e-9)
             if np.any(zero_mask):
                 diffs[:, zero_mask] = np.abs(flat_seqs[:, zero_mask])
             
-            # Check threshold
             matches = np.all(diffs < e, axis=1)
             
-            # Count True values (subtract 1 because it matches itself)
+            # Subtract 1 to remove self-match
             scores[i] = np.sum(matches) - 1
             if scores[i] < 0: scores[i] = 0
 
     print("\nScoring complete.")
 
-    # Package results
     scored_patterns = []
-    for i in range(limit_n):
-        idx_in_full = start_idx + i
+    for i in range(n):
         scored_patterns.append({
-            'sequence': seq_arr[idx_in_full], 
+            'sequence': seq_arr[i], 
             'score': scores[i],
-            'orig_idx': idx_in_full
+            'orig_idx': i
         })
         
     scored_patterns.sort(key=lambda x: x['score'], reverse=True)
@@ -227,53 +191,33 @@ def gettop(train_df, c, d, e):
     if top_n < 1: top_n = 1
     
     top_items = scored_patterns[:top_n]
-    
-    # Return metadata list and a clean numpy array of just the sequences for fast inference
     top_seqs_array = np.array([p['sequence'] for p in top_items])
     
     return top_items, top_seqs_array
 
 def completesimilarbeginnings(target_df, model_patterns_arr, d, e, raw_df=None, collect_debug=False):
-    """
-    Vectorized Backtesting/Inference.
-    model_patterns_arr shape: (NumPatterns, D, 4)
-    """
     if len(model_patterns_arr) == 0: return []
     
     results = []
     cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
     data_values = target_df[cols].values.astype(np.float32)
-    
-    # We look at D-1 length for matching
     beg_len = d - 1
     
-    # Create input sequences from target data: Shape (M, beg_len, 4)
     target_seqs = create_sequences(data_values, beg_len)
-    
-    # Flatten inputs: (M, beg_len*4)
     flat_targets = target_seqs.reshape(len(target_seqs), -1)
     
-    # Prepare Model Patterns: Take first D-1 rows, flatten: (NumPatterns, beg_len*4)
     model_begs = model_patterns_arr[:, :beg_len, :].reshape(len(model_patterns_arr), -1)
-    
-    # Extract Model Outcomes (Last candle, close_pct column is index 3): Shape (NumPatterns,)
     model_outcomes = model_patterns_arr[:, -1, 3]
     
     global debug_logs
     if collect_debug:
         debug_logs = []
 
-    # Iterate through validation/test time steps
-    # Note: We iterate because for each step we need to check against ALL models.
-    # While we could fully matrixize (M x P), memory might explode if M and P are large.
-    # Row-by-row against Matrix is a good balance.
-    
     num_steps = len(flat_targets)
     
     for i in range(num_steps):
         target_vec = flat_targets[i]
         
-        # --- Vectorized Match ---
         with np.errstate(divide='ignore', invalid='ignore'):
             safe_target = np.where(np.abs(target_vec) < 1e-9, 1e-9, target_vec)
             diffs = np.abs((model_begs - target_vec) / safe_target)
@@ -282,14 +226,11 @@ def completesimilarbeginnings(target_df, model_patterns_arr, d, e, raw_df=None, 
             if np.any(zero_mask):
                 diffs[:, zero_mask] = np.abs(model_begs[:, zero_mask])
                 
-            matches = np.all(diffs < e, axis=1) # Boolean array of shape (NumPatterns,)
+            matches = np.all(diffs < e, axis=1)
         
-        # Check if any match found
         match_indices = np.where(matches)[0]
-        
         prediction = 0
         
-        # Debug Logging
         if collect_debug and len(debug_logs) < 3:
             iter_log = {
                 'iteration': i, 
@@ -297,7 +238,6 @@ def completesimilarbeginnings(target_df, model_patterns_arr, d, e, raw_df=None, 
                 'matches': [],
                 'found_match': False
             }
-            # Log first few potential matches
             for m_idx in match_indices[:3]:
                 iter_log['matches'].append({
                     'pattern_idx': int(m_idx),
@@ -309,9 +249,6 @@ def completesimilarbeginnings(target_df, model_patterns_arr, d, e, raw_df=None, 
             debug_logs.append(iter_log)
 
         if len(match_indices) > 0:
-            # Found matches. 
-            # Strategy: Take the first match (as per original code logic "break")
-            # Or could vote. Original code used "break", so we take index 0.
             first_match_idx = match_indices[0]
             close_change = model_outcomes[first_match_idx]
             
@@ -320,16 +257,12 @@ def completesimilarbeginnings(target_df, model_patterns_arr, d, e, raw_df=None, 
         
         if prediction != 0:
             outcome_idx = i + beg_len
-            # Check bounds
             if outcome_idx < len(target_df):
                 entry_price = 0
                 exit_price = 0
                 raw_input_candles = []
                 
                 if raw_df is not None:
-                    # Adjust index mapping between derived (shorter) and raw
-                    # derived starts at index 1 of raw usually, but here mapped by date
-                    # Safest is to use the outcome_idx directly if aligned
                     raw_input_candles = raw_df.iloc[i : i + beg_len][['open','close']].values.tolist()
                     entry_price = raw_df.iloc[outcome_idx]['open']
                     exit_price = raw_df.iloc[outcome_idx]['close']
@@ -412,20 +345,15 @@ def live_loop_thread():
             if raw_df.empty: continue
             
             derived_df = deriveround(raw_df)
-            
-            # Prepare Input
             input_seq_df = derived_df.iloc[-(D_LEN): -1] 
             cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
             
-            # Shape (D-1, 4)
             current_seq = input_seq_df[cols].values.astype(np.float32)
-            flat_current = current_seq.flatten() # (Features,)
+            flat_current = current_seq.flatten() 
             
             pred_dir = 0
             
-            # Vectorized Match against Model Patterns
             if len(model_patterns_seqs) > 0:
-                # Prepare models: (N, D-1, 4) -> Flatten -> (N, Features)
                 beg_len = D_LEN - 1
                 model_begs = model_patterns_seqs[:, :beg_len, :].reshape(len(model_patterns_seqs), -1)
                 
@@ -441,9 +369,7 @@ def live_loop_thread():
                 
                 match_indices = np.where(matches)[0]
                 if len(match_indices) > 0:
-                    # Take first match logic
                     idx = match_indices[0]
-                    # close_pct is index 3
                     outcome = model_patterns_seqs[idx, -1, 3]
                     if outcome > 0: pred_dir = 1
                     elif outcome < 0: pred_dir = -1
@@ -459,10 +385,8 @@ def live_loop_thread():
             }
             current_prediction = pred_obj
             
-            # Close previous prediction
             if len(live_log) > 0 and live_log[-1]['status'] == 'OPEN':
                 last = live_log[-1]
-                # Assuming the candle that just closed is the outcome for the previous prediction
                 exit_price = raw_df.iloc[-2]['close'] 
                 last['exit'] = exit_price
                 d_val = 1 if last['prediction'] == "LONG" else (-1 if last['prediction'] == "SHORT" else 0)
@@ -474,7 +398,6 @@ def live_loop_thread():
             
             if pred_dir != 0: live_log.append(pred_obj)
             
-            # Prune log
             two_weeks = 14 * 24 * 3600
             now_ts = datetime.utcnow().timestamp()
             live_log[:] = [x for x in live_log if (now_ts - x['timestamp'].timestamp()) < two_weeks]
@@ -514,7 +437,7 @@ def dashboard():
     
     html = f"""
     <html>
-    <head><title>Trading Bot (Optimized)</title>
+    <head><title>Trading Bot (Full Scan)</title>
     <style>
         body {{ font-family: monospace; margin: 20px; }}
         h2 {{ border-bottom: 2px solid #ccc; padding-bottom: 5px; }}
@@ -529,7 +452,7 @@ def dashboard():
     </style>
     </head>
     <body>
-        <h1>Bot Status: {SYMBOL} {TIMEFRAME} (Vectorized)</h1>
+        <h1>Bot Status: {SYMBOL} {TIMEFRAME} (Full N x N)</h1>
         <div>
             <b>Backtest Accuracy:</b> {acc:.2%} ({total} trades)<br>
             <b>Current Prediction:</b> {current_prediction.get('prediction','N/A')} @ {current_prediction.get('entry',0)}
@@ -553,7 +476,7 @@ def dashboard():
             {''.join([f"<tr><td>{i+1}</td><td>{p['score']}</td><td><div class='code-block'>{p['sequence'].tolist()}</div></td></tr>" for i, p in enumerate(top_patterns_display)])}
         </table>
 
-        <h2>3. Algorithm Logic Debug (First 3 Iterations of Backtest)</h2>
+        <h2>3. Algorithm Logic Debug</h2>
         <div class="code-block">
         <pre>
 {''.join([f"ITERATION {l['iteration']}:\\n  Match: {l['found_match']}\\n  Checks: {l['matches']}\\n\\n" for l in debug_logs])}
@@ -590,32 +513,25 @@ def main():
     global model_patterns_meta, model_patterns_seqs, backtest_results, recent_perf_results
     global raw_plot_url, derived_plot_url
     
-    # 1. Fetch
     df = fetch(TIMEFRAME, SYMBOL, START_STR, END_STR)
     if df.empty:
         print("No data fetched! Check dates or network.")
         return
     print(f"Data fetched: {len(df)} rows.")
 
-    # 2. Derive
     df_derived = deriveround(df)
     
-    # 3. Plot (One time)
     raw_plot_url, derived_plot_url = generate_static_plots(df, df_derived)
     
-    # 4. Split
     train_df, test_df = split(df_derived, B_SPLIT)
     train_raw, test_raw = split(df, B_SPLIT)
     
-    # 5. Train (Pattern Mining)
-    # Returns metadata list and pure numpy array for inference
+    # Calls the Uncapped Version
     model_patterns_meta, model_patterns_seqs = gettop(train_df, C_TOP, D_LEN, E_SIM)
     
-    # 6. Backtest
     print("Running Backtest...")
     backtest_results = completesimilarbeginnings(test_df, model_patterns_seqs, D_LEN, E_SIM, test_raw, collect_debug=True)
     
-    # 7. Recent Performance
     print("Calculating Recent Performance...")
     two_weeks_ago = datetime.utcnow() - timedelta(days=14)
     if df['datetime'].max() > two_weeks_ago:
@@ -627,7 +543,6 @@ def main():
     acc, _, _ = get_accuracy_metrics(backtest_results)
     print(f"Backtest Accuracy: {acc:.2%}")
     
-    # 8. Start Live Loop
     t = threading.Thread(target=live_loop_thread)
     t.daemon = True
     t.start()
