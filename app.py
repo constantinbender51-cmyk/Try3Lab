@@ -1,475 +1,289 @@
-import requests
+import os
+import ccxt
 import pandas as pd
 import numpy as np
-import time
-import threading
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server usage
+import matplotlib.pyplot as plt
 import io
 import base64
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from flask import Flask, jsonify, render_template_string
-from datetime import datetime, timedelta
+from flask import Flask, render_template_string
 
-# --- Parameters ---
+# --- Configuration ---
+DATA_PATH = '/app/data/ohlc.csv'
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-START_STR = '2026-01-01 00:00:00' 
-END_STR = None 
-B_SPLIT = 0.70
-C_TOP = 0.20 # Unused now
-D_LEN = 4 
-E_SIM = 0.1 # Adjusted for Sum of Absolute Differences (SAD). 0.5 is a reasonable cumulative error threshold for pct changes.
-API_PORT = 8080
+LIMIT = 2000  # Number of candles to fetch
+THRESHOLD = 0.001  # Threshold for "0" direction (0.1% move)
+SPHERE_RADIUS = 0.05  # The radius of the fading sphere. Needs to be tuned to data scale.
+PORT = 8080
 
-# Global state
-live_log = []
-current_prediction = {}
-backtest_results = []
-recent_perf_results = []
-train_sequences = np.array([]) # The "Library" of history (Split 1)
-debug_logs = [] 
-raw_plot_url = ""
-derived_plot_url = ""
-plot_lock = threading.Lock()
 app = Flask(__name__)
 
-# --- Functions ---
+# --- 1. Fetch & 2/3. Save/Load ---
+def get_ohlc_data():
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
 
-def fetch(timeframe, symbol, start_str, end_str):
-    print(f"Fetching data for {symbol} ({timeframe}) via requests...")
-    api_symbol = symbol.replace('/', '')
-    base_url = 'https://api.binance.com/api/v3/klines'
-    
-    if start_str:
-        dt_obj = datetime.strptime(start_str, '%Y-%m-%d %H:%M:%S')
-        start_ts = int(dt_obj.timestamp() * 1000)
+    if os.path.exists(DATA_PATH):
+        print("Loading data from disk...")
+        df = pd.read_csv(DATA_PATH)
     else:
-        start_ts = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
-        
-    if end_str:
-        dt_end = datetime.strptime(end_str, '%Y-%m-%d %H:%M:%S')
-        end_ts = int(dt_end.timestamp() * 1000)
-    else:
-        end_ts = int(time.time() * 1000)
-        
-    all_data = []
-    current_start = start_ts
-    
-    while current_start < end_ts:
-        params = {'symbol': api_symbol, 'interval': timeframe, 'startTime': current_start, 'limit': 1000}
+        print("Fetching data from Binance...")
+        exchange = ccxt.binance()
         try:
-            response = requests.get(base_url, params=params)
-            data = response.json()
-            if isinstance(data, dict) and 'code' in data: break
-            if not data: break
-            all_data.extend(data)
-            current_start = data[-1][6] + 1
-            if data[-1][0] >= end_ts: break
-            time.sleep(0.05) 
+            ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LIMIT)
+            df = pd.DataFrame(ohlc, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df.to_csv(DATA_PATH, index=False)
         except Exception as e:
-            print(f"Error fetching: {e}")
-            break
+            return None, f"Error fetching data: {str(e)}"
     
-    if not all_data: return pd.DataFrame()
+    return df, None
 
-    df = pd.DataFrame(all_data, columns=[
-        'timestamp', 'open', 'high', 'low', 'close', 'volume', 
-        'close_time', 'quote_asset_vol', 'trades', 'tb_base_vol', 'tb_quote_vol', 'ignore'
-    ])
+# --- 4. Processing ---
+def process_data(df):
+    raw_ohlc = df[['open', 'high', 'low', 'close']].values
     
-    cols = ['open', 'high', 'low', 'close', 'volume']
-    df[cols] = df[cols].apply(pd.to_numeric, axis=1)
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+    # Derivative OHLC (Change from previous candle)
+    # Assume first entry is 0 to match dimensions
+    derivative_ohlc = np.diff(raw_ohlc, axis=0, prepend=0)
     
-    if end_str: df = df[df['timestamp'] <= end_ts]
-    return df
-
-def deriveround(df):
-    df_derived = df.copy()
-    cols = ['open', 'high', 'low', 'close']
-    derived_cols = []
-    for col in cols:
-        df_derived[f'{col}_pct'] = df[col].pct_change()
-        derived_cols.append(f'{col}_pct')
+    # We use derivative data for features to make them stationary (comparable over time)
+    # normalize derivative data for the "sphere" logic to work better
+    # Simple min-max or std scaling is usually needed for distance-based algos.
+    # However, to strictly follow "raw/derivative" without external scaler libraries, 
+    # we proceed with derivative_ohlc.
     
-    df_derived[derived_cols] = df_derived[derived_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    return df_derived
+    return raw_ohlc, derivative_ohlc
 
-def split(df, b):
-    if len(df) == 0: return df, df
-    split_idx = int(len(df) * b)
-    return df.iloc[:split_idx].reset_index(drop=True), df.iloc[split_idx:].reset_index(drop=True)
+# --- 6. Sequences & 7. Labeling ---
+def create_dataset(data, raw_close, seq_length=3):
+    X = []
+    y = []
+    y_raw_change = [] # To calc PnL later
 
-def create_sequences(data, d):
-    n_samples = len(data) - d + 1
-    if n_samples <= 0: return np.array([])
-    window_shape = (n_samples, d, data.shape[1])
-    window_strides = (data.strides[0], data.strides[0], data.strides[1])
-    sequences = np.lib.stride_tricks.as_strided(data, shape=window_shape, strides=window_strides, writeable=False)
-    return sequences.copy()
+    # We need 3 candles for X, and the 4th candle for y
+    for i in range(len(data) - seq_length):
+        # Feature: Flatten 3 candles * 4 dims = 12 dims
+        seq = data[i:i+seq_length].flatten()
+        X.append(seq)
+        
+        # Target: 4th candle direction
+        # We compare Close of (i+seq_length) vs Close of (i+seq_length-1)
+        current_close = raw_close[i+seq_length-1]
+        next_close = raw_close[i+seq_length]
+        
+        change_pct = (next_close - current_close) / current_close
+        y_raw_change.append(change_pct)
+        
+        if change_pct > THRESHOLD:
+            label = 1.0
+        elif change_pct < -THRESHOLD:
+            label = -1.0
+        else:
+            label = 0.0
+        y.append(label)
 
-def find_best_match_vote(target_seq, history_seqs, e_threshold):
+    return np.array(X), np.array(y), np.array(y_raw_change)
+
+# --- 8 & 9. The Painting Algorithm ---
+def infer_painting(X_train, y_train, X_test):
     """
-    1. Calculates Sum of Absolute Differences (SAD) between target and all history.
-    2. Filters those < e_threshold.
-    3. Votes on outcome (Next Candle Close Change) based on matches.
+    Implements the 13-dimensional painting logic.
     """
-    if len(history_seqs) == 0: return 0, 0, 0
-
-    # History Seqs shape: (N, D, 4)
-    # Target Seq shape: (D-1, 4) (Needs to be compared to first D-1 of history)
+    # Construct the 13-dimensional Training Points
+    # X_train is (N, 12), y_train is (N,). We stack them to (N, 13)
+    train_points_13d = np.hstack((X_train, y_train.reshape(-1, 1)))
     
-    beg_len = len(target_seq)
-    history_begs = history_seqs[:, :beg_len, :] # (N, beg_len, 4)
+    predictions = []
     
-    # --- 1. Calculate SAD (Sum of Absolute Differences) ---
-    # target_seq must be broadcasted
-    # diffs shape: (N, beg_len, 4)
-    diffs = np.abs(history_begs - target_seq)
+    # Possible directions for the 13th dimension
+    candidates = [-1.0, 0.0, 1.0]
     
-    # Sum over length and features to get one score per history item
-    # axis=(1,2) sums the inner window and features
-    scores = np.sum(diffs, axis=(1, 2)) # Shape (N,)
+    print(f"Running inference on {len(X_test)} points. This might take a moment...")
     
-    # --- 2. Filter ---
-    match_mask = scores < e_threshold
-    match_indices = np.where(match_mask)[0]
-    
-    if len(match_indices) == 0:
-        return 0, 0, 0 # No matches found
-    
-    # --- 3. Vote on Outcome ---
-    # Get outcomes of matching sequences (Last candle, Close% is index 3)
-    outcomes = history_seqs[match_indices, -1, 3]
-    
-    longs = np.sum(outcomes > 0)
-    shorts = np.sum(outcomes < 0)
-    
-    # Calculate probability of the dominant direction
-    total_matches = len(outcomes)
-    
-    if longs > shorts:
-        prob = longs / total_matches
-        return 1, prob, total_matches
-    elif shorts > longs:
-        prob = shorts / total_matches
-        return -1, prob, total_matches
-    else:
-        return 0, 0, total_matches
-
-def backtest_logic(target_df, training_library, d, e, raw_df=None, collect_debug=False):
-    results = []
-    cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
-    data_values = target_df[cols].values.astype(np.float32)
-    beg_len = d - 1
-    
-    # Create windows for the target dataset
-    target_seqs = create_sequences(data_values, beg_len) # Shape (M, beg_len, 4)
-    
-    global debug_logs
-    if collect_debug: debug_logs = []
-
-    print(f"Backtesting {len(target_seqs)} candles against {len(training_library)} history patterns...")
-
-    for i in range(len(target_seqs)):
-        if i % 100 == 0: print(f"Step {i}/{len(target_seqs)}", end='\r')
+    # For every point in test set
+    for i, x_t in enumerate(X_test):
+        best_intensity = -1
+        best_dir = 0
         
-        current_seq = target_seqs[i]
+        # We test which "height" (direction) in the 13th dimension has the most "paint"
+        for cand_dir in candidates:
+            # Construct the test point in 13D space with the hypothesis direction
+            test_point_13d = np.append(x_t, cand_dir)
+            
+            # Vectorized Euclidean distance calculation
+            # Dist between this test hypothesis and ALL training spheres
+            dists = np.linalg.norm(train_points_13d - test_point_13d, axis=1)
+            
+            # Fading sphere function: 1 in middle, decreases to 0. 
+            # Logic: Intensity = max(0, 1 - (dist / RADIUS))
+            # If dist > RADIUS, intensity is 0.
+            
+            # We scale distance to make the radius effective.
+            intensities = np.maximum(0, 1 - (dists / SPHERE_RADIUS))
+            
+            total_intensity = np.sum(intensities)
+            
+            if total_intensity > best_intensity:
+                best_intensity = total_intensity
+                best_dir = cand_dir
         
-        # Perform Search & Vote
-        direction, probability, match_count = find_best_match_vote(current_seq, training_library, e)
+        predictions.append(best_dir)
         
-        # Debugging
-        if collect_debug and len(debug_logs) < 3:
-            debug_logs.append({
-                'iteration': i,
-                'input': current_seq.tolist(),
-                'found_matches': int(match_count),
-                'vote_direction': direction,
-                'probability': float(probability)
-            })
+    return np.array(predictions)
 
-        if direction != 0:
-            outcome_idx = i + beg_len
-            if outcome_idx < len(target_df):
-                entry_price = 0
-                exit_price = 0
-                raw_input_candles = []
-                
-                if raw_df is not None:
-                    raw_input_candles = raw_df.iloc[i : i + beg_len][['open','close']].values.tolist()
-                    entry_price = raw_df.iloc[outcome_idx]['open']
-                    exit_price = raw_df.iloc[outcome_idx]['close']
-                
-                pnl = 0
-                if entry_price > 0:
-                    pnl = direction * (exit_price - entry_price) / entry_price
-                
-                results.append({
-                    'timestamp': target_df.iloc[outcome_idx]['datetime'],
-                    'input_candles': raw_input_candles,
-                    'prediction': "LONG" if direction == 1 else "SHORT",
-                    'probability': probability,
-                    'matches': match_count,
-                    'entry': entry_price,
-                    'exit': exit_price,
-                    'outcome': "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT"),
-                    'pnl': pnl
-                })
-    print("\nBacktest Complete.")
-    return results
-
-def get_accuracy_metrics(results):
-    if not results: return 0, 0, []
-    wins = sum(1 for r in results if r['pnl'] > 0)
-    losses = sum(1 for r in results if r['pnl'] < 0)
-    total = wins + losses
-    acc = (wins / total) if total > 0 else 0
-    cum_pnl = np.cumsum([r['pnl'] for r in results])
-    return acc, total, cum_pnl
-
-def generate_static_plots(df, df_derived):
-    if df.empty: return "", ""
-    with plot_lock:
-        img = io.BytesIO()
-        plt.figure(figsize=(10, 4))
-        plt.plot(df['datetime'], df['close'], label='Close Price')
-        plt.title(f"Raw Data: {SYMBOL} Close Price")
-        plt.xlabel("Date")
-        plt.ylabel("Price")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(img, format='png')
-        img.seek(0)
-        raw_b64 = base64.b64encode(img.getvalue()).decode()
-        plt.close()
-
-        img2 = io.BytesIO()
-        plt.figure(figsize=(10, 4))
-        plt.plot(df_derived['datetime'], df_derived['close_pct'], color='orange', label='Close % Change', alpha=0.7)
-        plt.title(f"Derived Data: {SYMBOL} Close % Change")
-        plt.xlabel("Date")
-        plt.ylabel("% Change")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(img2, format='png')
-        img2.seek(0)
-        derived_b64 = base64.b64encode(img2.getvalue()).decode()
-        plt.close()
-    return raw_b64, derived_b64
-
-# --- Threading & Live Logic ---
-
-def live_loop_thread():
-    global current_prediction, live_log
-    while True:
-        try:
-            now = datetime.utcnow()
-            tf_seconds = 3600
-            if 'm' in TIMEFRAME: tf_seconds = int(TIMEFRAME.replace('m','')) * 60
-            elif 'h' in TIMEFRAME: tf_seconds = int(TIMEFRAME.replace('h','')) * 3600
-            
-            timestamp = now.timestamp()
-            next_ts = (int(timestamp / tf_seconds) + 1) * tf_seconds
-            wait_seconds = next_ts - timestamp + 5 
-            if wait_seconds < 0: wait_seconds = 0
-            time.sleep(wait_seconds)
-            
-            # Fetch Live Data
-            raw_df = fetch(TIMEFRAME, SYMBOL, None, None)
-            if raw_df.empty: continue
-            
-            derived_df = deriveround(raw_df)
-            
-            # Get Current Sequence
-            input_seq_df = derived_df.iloc[-(D_LEN): -1] 
-            cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
-            current_seq = input_seq_df[cols].values.astype(np.float32) # Shape (D-1, 4)
-            
-            # Search History (Split 1 Library)
-            pred_dir, prob, matches = find_best_match_vote(current_seq, train_sequences, E_SIM)
-            
-            entry_price = raw_df.iloc[-1]['open']
-            pred_obj = {
-                'timestamp': datetime.utcnow(),
-                'input_candles': raw_df.iloc[-(D_LEN): -1][['open','close']].values.tolist(),
-                'prediction': "LONG" if pred_dir == 1 else ("SHORT" if pred_dir == -1 else "FLAT"),
-                'probability': float(prob),
-                'matches': int(matches),
-                'entry': entry_price,
-                'status': 'OPEN',
-                'exit': None, 'pnl': 0
-            }
-            current_prediction = pred_obj
-            
-            # Close previous prediction
-            if len(live_log) > 0 and live_log[-1]['status'] == 'OPEN':
-                last = live_log[-1]
-                exit_price = raw_df.iloc[-2]['close'] 
-                last['exit'] = exit_price
-                d_val = 1 if last['prediction'] == "LONG" else (-1 if last['prediction'] == "SHORT" else 0)
-                if d_val != 0:
-                    last['pnl'] = d_val * (exit_price - last['entry']) / last['entry']
-                    last['outcome'] = "WIN" if last['pnl'] > 0 else "LOSS"
-                else: last['outcome'] = "FLAT"
-                last['status'] = 'CLOSED'
-            
-            if pred_dir != 0: live_log.append(pred_obj)
-            
-            # Prune
-            two_weeks = 14 * 24 * 3600
-            now_ts = datetime.utcnow().timestamp()
-            live_log[:] = [x for x in live_log if (now_ts - x['timestamp'].timestamp()) < two_weeks]
-            
-        except Exception as e:
-            print(f"Error in live loop: {e}")
-            time.sleep(60)
-
-# --- Server ---
-
-@app.route('/')
-def dashboard():
-    with plot_lock:
-        img = io.BytesIO()
-        plt.figure(figsize=(12, 5))
-        dates = [r['timestamp'] for r in backtest_results]
-        pnls = np.cumsum([r['pnl'] for r in backtest_results])
-        plt.subplot(1, 2, 1)
-        if len(dates) > 0: plt.plot(dates, pnls, label='Backtest PnL')
-        plt.title("Backtest PnL")
-        
-        if recent_perf_results:
-            dates_rec = [r['timestamp'] for r in recent_perf_results]
-            pnls_rec = np.cumsum([r['pnl'] for r in recent_perf_results])
-            plt.subplot(1, 2, 2)
-            plt.plot(dates_rec, pnls_rec, color='orange', label='14d Performance')
-            plt.title("Recent 14d Performance")
-        
-        plt.tight_layout()
-        plt.savefig(img, format='png')
-        img.seek(0)
-        backtest_plot_url = base64.b64encode(img.getvalue()).decode()
-        plt.close()
+# --- Plotting Utility ---
+def create_plots(y_test, predictions, pnl_curve):
+    # Plot 1: PnL Curve
+    fig1, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.plot(np.cumsum(pnl_curve), label='Cumulative PnL (%)', color='green')
+    ax1.set_title('Strategy PnL over Test Set')
+    ax1.set_xlabel('Trade #')
+    ax1.set_ylabel('Return')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
     
-    acc, total, _ = get_accuracy_metrics(backtest_results)
+    img1 = io.BytesIO()
+    fig1.savefig(img1, format='png')
+    img1.seek(0)
+    plot_url1 = base64.b64encode(img1.getvalue()).decode()
+    plt.close(fig1)
+
+    # Plot 2: Confusion Matrix / Distribution
+    fig2, ax2 = plt.subplots(figsize=(6, 6))
+    # Simple scatter or bar chart of predictions vs actual
+    from sklearn.metrics import confusion_matrix
+    try:
+        cm = confusion_matrix(y_test, predictions, labels=[-1, 0, 1])
+        im = ax2.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+        ax2.figure.colorbar(im, ax=ax2)
+        ax2.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]),
+               xticklabels=[-1, 0, 1], yticklabels=[-1, 0, 1],
+               title='Confusion Matrix', ylabel='True Label', xlabel='Predicted Label')
+    except:
+        ax2.text(0.5, 0.5, "Insufficient data for Matrix", ha='center')
     
-    html = f"""
-    <html>
-    <head><title>Trading Bot (Probability Vote)</title>
+    img2 = io.BytesIO()
+    fig2.savefig(img2, format='png')
+    img2.seek(0)
+    plot_url2 = base64.b64encode(img2.getvalue()).decode()
+    plt.close(fig2)
+
+    return plot_url1, plot_url2
+
+# --- HTML Template ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>13D Painting Trading Strategy</title>
     <style>
-        body {{ font-family: monospace; margin: 20px; }}
-        h2 {{ border-bottom: 2px solid #ccc; padding-bottom: 5px; }}
-        table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; font-size: 0.85em; }}
-        th, td {{ border: 1px solid #ddd; padding: 6px; text-align: left; }}
-        th {{ background-color: #eee; }}
-        .win {{ color: green; font-weight: bold; }}
-        .loss {{ color: red; font-weight: bold; }}
-        .container {{ display: flex; flex-wrap: wrap; }}
-        .box {{ flex: 1; min-width: 400px; margin: 10px; }}
-        .code-block {{ background: #f4f4f4; padding: 10px; border: 1px solid #ddd; overflow-x: auto; }}
+        body { font-family: sans-serif; margin: 2rem; background: #f0f2f5; }
+        .container { max-width: 1000px; margin: 0 auto; background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #333; }
+        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-bottom: 2rem; }
+        .stat-box { background: #f8f9fa; padding: 1rem; border-radius: 4px; text-align: center; border: 1px solid #dee2e6; }
+        .stat-val { font-size: 1.5rem; font-weight: bold; color: #007bff; }
+        .plots { display: flex; flex-wrap: wrap; gap: 2rem; justify-content: center; }
+        img { max-width: 100%; height: auto; border: 1px solid #ddd; }
+        table { width: 100%; border-collapse: collapse; margin-top: 2rem; }
+        th, td { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #f2f2f2; }
     </style>
-    </head>
-    <body>
-        <h1>Bot Status: {SYMBOL} {TIMEFRAME} (SAD Metric + Voting)</h1>
-        <div>
-            <b>Backtest Accuracy:</b> {acc:.2%} ({total} trades)<br>
-            <b>Current Prediction:</b> {current_prediction.get('prediction','N/A')} (Prob: {current_prediction.get('probability',0):.2f})
-        </div>
+</head>
+<body>
+    <div class="container">
+        <h1>13-Dimensional "Sphere" Inference Results</h1>
         
-        <h2>1. Data Visualization</h2>
-        <div class="container">
-            <div class="box">
-                <h4>Raw Prices (Close)</h4>
-                <img src="data:image/png;base64,{raw_plot_url}" style="width:100%">
+        <div class="stats-grid">
+            <div class="stat-box">
+                <div>Accuracy</div>
+                <div class="stat-val">{{ accuracy }}%</div>
             </div>
-            <div class="box">
-                <h4>Derived Data (Close % Change)</h4>
-                <img src="data:image/png;base64,{derived_plot_url}" style="width:100%">
+            <div class="stat-box">
+                <div>Total PnL</div>
+                <div class="stat-val">{{ total_pnl }}%</div>
+            </div>
+            <div class="stat-box">
+                <div>Test Samples</div>
+                <div class="stat-val">{{ num_samples }}</div>
             </div>
         </div>
 
-        <h2>2. Live Prediction Log</h2>
-        <table>
-            <tr><th>Time</th><th>Pred</th><th>Matches</th><th>Prob</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>
-            {''.join([f"<tr><td>{r['timestamp']}</td><td>{r['prediction']}</td><td>{r.get('matches',0)}</td><td>{r.get('probability',0):.2f}</td><td>{r['entry']}</td><td>{r['exit']}</td><td class='{r.get('outcome','').lower()}'>{r.get('outcome','OPEN')}</td><td>{r['pnl']:.4f}</td></tr>" for r in reversed(live_log)])}
-        </table>
-
-        <h2>3. Debug (First 3 Backtest Iterations)</h2>
-        <div class="code-block">
-        <pre>
-{''.join([f"ITERATION {l['iteration']}: Matches Found: {l['found_matches']} | Vote: {l['vote_direction']} | Prob: {l['probability']:.2f}\\n" for l in debug_logs])}
-        </pre>
+        <div class="plots">
+            <div><img src="data:image/png;base64,{{ plot_pnl }}"></div>
+            <div><img src="data:image/png;base64,{{ plot_cm }}"></div>
         </div>
 
-        <h2>4. Recent Performance (Last 14d)</h2>
-        <img src="data:image/png;base64,{backtest_plot_url}" style="width:100%; max-width:1000px">
-        <table>
-            <tr><th>Time</th><th>Pred</th><th>Matches</th><th>Prob</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>
-             {''.join([f"<tr><td>{r['timestamp']}</td><td>{r['prediction']}</td><td>{r['matches']}</td><td>{r['probability']:.2f}</td><td>{r['entry']}</td><td>{r['exit']}</td><td class='{r['outcome'].lower()}'>{r['outcome']}</td><td>{r['pnl']:.4f}</td></tr>" for r in reversed(recent_perf_results)])}
-        </table>
-    </body>
-    </html>
-    """
-    return render_template_string(html)
+        <h3>Recent Trades (Last 20)</h3>
+        {{ table_html|safe }}
+    </div>
+</body>
+</html>
+"""
 
-@app.route('/api')
-def api_endpoint():
-    return jsonify({
-        'current_prediction': current_prediction,
-        'live_log': live_log,
-        'debug_logs': debug_logs
+# --- Main Route ---
+@app.route('/')
+def index():
+    # 1. Pipeline
+    df, err = get_ohlc_data()
+    if df is None:
+        return f"<h1>Error</h1><p>{err}</p>"
+    
+    # 2. Preprocess
+    raw_ohlc, derivative_ohlc = process_data(df)
+    
+    # 3. Create Sequences (Points in 12D)
+    # Using derivative_ohlc for features as raw prices don't work with distance metrics over time
+    X, y, y_raw_change = create_dataset(derivative_ohlc, df['close'].values, seq_length=3)
+    
+    # 4. Split 70/30
+    split_idx = int(len(X) * 0.70)
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+    y_change_test = y_raw_change[split_idx:]
+    
+    # 5. Inference (The Painting)
+    # Normalize data for distance calculation logic (crude normalization based on train stats)
+    # This ensures the "Sphere Radius" is meaningful across different price scales
+    mean = np.mean(X_train, axis=0)
+    std = np.std(X_train, axis=0) + 1e-8
+    
+    X_train_norm = (X_train - mean) / std
+    X_test_norm = (X_test - mean) / std
+    
+    preds = infer_painting(X_train_norm, y_train, X_test_norm)
+    
+    # 6. Calc Metrics
+    correct = (preds == y_test)
+    accuracy = np.mean(correct) * 100
+    
+    # PnL: If pred is 1, return is change. If -1, return is -change. If 0, 0.
+    # We use y_change_test (the actual % movement)
+    strategy_returns = preds * y_change_test
+    total_pnl = np.sum(strategy_returns) * 100
+    
+    # 7. Formatting for Web
+    # Create DataFrame for display
+    results_df = pd.DataFrame({
+        'Actual_Dir': y_test,
+        'Predicted_Dir': preds,
+        'Actual_Return': y_change_test,
+        'Strat_Return': strategy_returns
     })
-
-def main():
-    global train_sequences, backtest_results, recent_perf_results
-    global raw_plot_url, derived_plot_url
     
-    # 1. Fetch
-    df = fetch(TIMEFRAME, SYMBOL, START_STR, END_STR)
-    if df.empty:
-        print("No data fetched! Check dates or network.")
-        return
-    print(f"Data fetched: {len(df)} rows.")
-
-    # 2. Derive & Plot
-    df_derived = deriveround(df)
-    raw_plot_url, derived_plot_url = generate_static_plots(df, df_derived)
+    table_html = results_df.tail(20).to_html(classes='table', float_format=lambda x: '%.5f' % x)
+    plot_pnl, plot_cm = create_plots(y_test, preds, strategy_returns)
     
-    # 3. Split
-    train_df, test_df = split(df_derived, B_SPLIT)
-    train_raw, test_raw = split(df, B_SPLIT)
-    
-    # 4. Create Library (Split 1)
-    print("Building Training Library (Split 1)...")
-    cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
-    train_data = train_df[cols].values.astype(np.float32)
-    train_sequences = create_sequences(train_data, D_LEN)
-    print(f"Library created with {len(train_sequences)} patterns.")
-    
-    # 5. Backtest (Split 2 vs Split 1)
-    print("Running Backtest...")
-    backtest_results = backtest_logic(test_df, train_sequences, D_LEN, E_SIM, test_raw, collect_debug=True)
-    
-    # 6. Recent Performance
-    print("Calculating Recent Performance...")
-    two_weeks_ago = datetime.utcnow() - timedelta(days=14)
-    if df['datetime'].max() > two_weeks_ago:
-        mask = df['datetime'] > two_weeks_ago
-        recent_perf_results = backtest_logic(df_derived[mask], train_sequences, D_LEN, E_SIM, df[mask])
-    else:
-        recent_perf_results = []
-    
-    acc, _, _ = get_accuracy_metrics(backtest_results)
-    print(f"Backtest Accuracy: {acc:.2%}")
-    
-    # 7. Start Live Loop
-    t = threading.Thread(target=live_loop_thread)
-    t.daemon = True
-    t.start()
-    
-    print(f"Serving on port {API_PORT}")
-    app.run(host='0.0.0.0', port=API_PORT)
+    return render_template_string(HTML_TEMPLATE, 
+                                  accuracy=f"{accuracy:.2f}", 
+                                  total_pnl=f"{total_pnl:.2f}",
+                                  num_samples=len(X_test),
+                                  plot_pnl=plot_pnl,
+                                  plot_cm=plot_cm,
+                                  table_html=table_html)
 
 if __name__ == '__main__':
-    main()
+    print(f"Starting server on port {PORT}...")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
