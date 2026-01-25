@@ -9,9 +9,11 @@ import base64
 import time
 import sys
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 import json
+import threading
+import os
 
 # ---------------------------------------------------------
 # 7. Parameters
@@ -27,49 +29,69 @@ TRAIN_SPLIT_RATIO = 0.7
 # Search from 0.1% to 5% grid sizes
 GRID_SEARCH_VALUES = [0.001, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]
 
+# Global Storage for Server and Live Loop
+GLOBAL_BEST_RESULT = None
+GLOBAL_PLOT_B64 = None
+GLOBAL_MODEL = {} # Stores the trained pattern map for live use
+GLOBAL_GRID_SIZE = 0.0
+GLOBAL_PRECISION = 8
+
 # ---------------------------------------------------------
-# 1. Fetch 1h ohlc from binance
+# 1. Fetch Data
 # ---------------------------------------------------------
-def fetch_binance_data(symbol, interval, start_str, end_str):
-    print(f"Fetching {symbol} {interval} data from {start_str} to {end_str}...")
+def fetch_binance_data(symbol, interval, start_str, end_str=None, limit=1000):
+    """
+    Fetches historical data. If end_str is None, fetches most recent data suitable for live loop.
+    """
     base_url = "https://api.binance.com/api/v3/klines"
     
-    start_ts = int(pd.Timestamp(start_str).timestamp() * 1000)
-    end_ts = int(pd.Timestamp(end_str).timestamp() * 1000)
-    
-    all_data = []
-    
-    while start_ts < end_ts:
+    # If end_str is provided, we are in backtest mode (historical range)
+    if end_str:
+        print(f"Fetching {symbol} {interval} data from {start_str} to {end_str}...")
+        start_ts = int(pd.Timestamp(start_str).timestamp() * 1000)
+        end_ts = int(pd.Timestamp(end_str).timestamp() * 1000)
+        
+        all_data = []
+        
+        while start_ts < end_ts:
+            params = {
+                'symbol': symbol,
+                'interval': interval,
+                'startTime': start_ts,
+                'endTime': end_ts,
+                'limit': limit
+            }
+            try:
+                response = requests.get(base_url, params=params)
+                data = response.json()
+                if not isinstance(data, list) or len(data) == 0:
+                    break
+                all_data.extend(data)
+                last_close_time = data[-1][6]
+                start_ts = last_close_time + 1
+                time.sleep(0.05) 
+                sys.stdout.write(f"\rFetched {len(all_data)} candles...")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"Error fetching data: {e}")
+                break
+        print("\nData fetch complete.")
+        
+    else:
+        # Live mode: just fetch recent candles
+        # We need at least 3 completed candles for the sequence (T-2, T-1, T0)
         params = {
             'symbol': symbol,
             'interval': interval,
-            'startTime': start_ts,
-            'endTime': end_ts,
-            'limit': 1000
+            'limit': 5 
         }
-        
         try:
             response = requests.get(base_url, params=params)
-            data = response.json()
-            
-            if not isinstance(data, list) or len(data) == 0:
-                break
-                
-            all_data.extend(data)
-            
-            last_close_time = data[-1][6]
-            start_ts = last_close_time + 1
-            
-            time.sleep(0.05) 
-            sys.stdout.write(f"\rFetched {len(all_data)} candles...")
-            sys.stdout.flush()
-            
+            all_data = response.json()
         except Exception as e:
-            print(f"Error fetching data: {e}")
-            break
-            
-    print("\nData fetch complete.")
-    
+            print(f"Error fetching live data: {e}")
+            return pd.DataFrame()
+
     df = pd.DataFrame(all_data, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_asset_volume', 'trades', 
@@ -91,20 +113,57 @@ def calculate_sharpe_ratio(returns_series, periods_per_year=24*365):
     """
     if len(returns_series) < 2:
         return 0.0
-    
     mean_ret = np.mean(returns_series)
     std_ret = np.std(returns_series)
-    
     if std_ret == 0:
         return 0.0
-        
     # Annualize
     sharpe = (mean_ret / std_ret) * np.sqrt(periods_per_year)
     return sharpe
 
 # ---------------------------------------------------------
-# Processing & Backtesting Logic (Refactored for Loop)
+# Processing & Backtesting Logic
 # ---------------------------------------------------------
+def train_model(df, grid_size, needed_precision):
+    """
+    Re-trains the model on the provided dataframe to generate the lookup dictionary.
+    Used for final model generation after grid search.
+    """
+    # Rounding logic
+    df = df.copy()
+    df['rounded_close'] = ((df['close'] / grid_size).round() * grid_size).round(needed_precision)
+    
+    # Targets
+    df['next_rounded'] = df['rounded_close'].shift(-1)
+    
+    conditions = [
+        df['next_rounded'] > df['rounded_close'],
+        df['next_rounded'] < df['rounded_close']
+    ]
+    choices = ['UP', 'DOWN']
+    df['target_direction'] = np.select(conditions, choices, default='FLAT')
+    
+    # Sequences
+    df['t_0'] = df['rounded_close']
+    df['t_1'] = df['rounded_close'].shift(1)
+    df['t_2'] = df['rounded_close'].shift(2)
+    
+    data = df.dropna().copy()
+    
+    # Train Map
+    sequence_map = defaultdict(list)
+    for _, row in data.iterrows():
+        seq = (row['t_2'], row['t_1'], row['t_0'])
+        sequence_map[seq].append(row['target_direction'])
+        
+    final_model = {}
+    for seq, directions in sequence_map.items():
+        counts = Counter(directions)
+        most_common = counts.most_common(1)[0][0]
+        final_model[seq] = most_common
+        
+    return final_model
+
 def evaluate_strategy(df_original, grid_percent, verbose=False):
     """
     Runs the strategy for a specific grid_percent.
@@ -123,9 +182,6 @@ def evaluate_strategy(df_original, grid_percent, verbose=False):
         needed_precision = int(math.ceil(-math.log10(grid_size))) + 2
     needed_precision = max(2, min(needed_precision, 10))
     
-    if verbose:
-        print(f"Grid: {grid_percent*100}% | Size: {grid_size} | Precision: {needed_precision}")
-
     # Rounding logic
     df['rounded_close'] = ((df['close'] / grid_size).round() * grid_size).round(needed_precision)
     
@@ -156,7 +212,7 @@ def evaluate_strategy(df_original, grid_percent, verbose=False):
     train_df = data.iloc[:split_idx]
     test_df = data.iloc[split_idx:]
     
-    # Train
+    # Train (Inline for speed)
     sequence_map = defaultdict(list)
     for _, row in train_df.iterrows():
         seq = (row['t_2'], row['t_1'], row['t_0'])
@@ -199,8 +255,6 @@ def evaluate_strategy(df_original, grid_percent, verbose=False):
             
         cumulative_pnl += trade_pnl
         
-        # Calculate Percentage Return for Sharpe (PnL / Investment)
-        # Investment is effectively the current price (assuming 1 unit)
         pct_return = trade_pnl / curr_price if curr_price > 0 else 0
         hourly_returns.append(pct_return)
         
@@ -242,14 +296,9 @@ def run_grid_search(df):
     best_sharpe = -float('inf')
     best_result = None
     
-    results_summary = []
-    
     for gp in GRID_SEARCH_VALUES:
         res = evaluate_strategy(df, gp, verbose=False)
-        
         print(f"Grid: {gp*100:5.2f}% | Sharpe: {res['sharpe']:6.3f} | Acc: {res['accuracy']:5.2f}% | PnL: {res['cumulative_pnl']:8.4f}")
-        
-        results_summary.append((gp, res['sharpe']))
         
         if res['sharpe'] > best_sharpe:
             best_sharpe = res['sharpe']
@@ -260,14 +309,11 @@ def run_grid_search(df):
     return best_result
 
 # ---------------------------------------------------------
-# 6. Serve plot and table
+# Visualization & Server
 # ---------------------------------------------------------
 def create_plot(df, test_results, accuracy, total_pnl, symbol, grid_percent):
     plt.figure(figsize=(12, 6))
     plt.plot(df['open_time'], df['close'], label='Price', color='gray', alpha=0.3)
-    
-    # Filter df to match test_results timeframe for alignment if needed, 
-    # but strictly we just plot the PnL curve overlay
     
     test_times = [x['time_t'] for x in test_results]
     test_pnl = [x['cum_pnl'] for x in test_results]
@@ -406,10 +452,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# Global placeholders for the server
-global_best_result = None
-global_plot_b64 = None
-
 class BacktestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -417,7 +459,11 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         
         # Unpack global results
-        res = global_best_result
+        res = GLOBAL_BEST_RESULT
+        if not res:
+            self.wfile.write(b"Results not ready yet. Please wait for backtest to finish.")
+            return
+
         test_results = res['test_results']
         needed_precision = res['needed_precision']
         
@@ -452,7 +498,7 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
             sharpe=res['sharpe'],
             accuracy=res['accuracy'],
             pnl=pnl_fmt,
-            plot_data=global_plot_b64,
+            plot_data=GLOBAL_PLOT_B64,
             json_data=json_str,
             precision=needed_precision
         )
@@ -460,23 +506,120 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(html_content.encode('utf-8'))
 
 # ---------------------------------------------------------
+# Live Prediction Logic
+# ---------------------------------------------------------
+def save_live_prediction(timestamp, close_price, sequence, prediction):
+    """
+    Appends the prediction to a CSV log file.
+    """
+    file_exists = os.path.isfile("live_prediction_log.csv")
+    
+    with open("live_prediction_log.csv", "a") as f:
+        if not file_exists:
+            f.write("timestamp,close_price,sequence_t2,sequence_t1,sequence_t0,prediction\n")
+        
+        seq_str = f"{sequence[0]},{sequence[1]},{sequence[2]}"
+        f.write(f"{timestamp},{close_price},{seq_str},{prediction}\n")
+    
+    print(f"Logged prediction: {prediction} for seq {sequence}")
+
+def live_loop():
+    print(f"\n--- Starting Live Prediction Loop for {SYMBOL} ---")
+    
+    # Ensure we have the global model and grid size from the backtest
+    if not GLOBAL_MODEL or GLOBAL_GRID_SIZE == 0:
+        print("Error: Global model not trained. Live loop aborting.")
+        return
+
+    while True:
+        # 1. Calculate time until next hour + 5 seconds buffer
+        now = datetime.now()
+        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        
+        # Add buffer to ensure exchange data is ready
+        fetch_time = next_hour + timedelta(seconds=5)
+        
+        sleep_seconds = (fetch_time - now).total_seconds()
+        
+        print(f"\n[Live] Current time: {now.strftime('%H:%M:%S')}")
+        print(f"[Live] Sleeping for {sleep_seconds:.0f} seconds until {fetch_time.strftime('%H:%M:%S')}...")
+        
+        time.sleep(sleep_seconds)
+        
+        # 2. Wake up and fetch recent data
+        print(f"\n[Live] Waking up. Fetching recent candles for {SYMBOL}...")
+        df_live = fetch_binance_data(SYMBOL, INTERVAL, start_str=None, end_str=None)
+        
+        if len(df_live) < 3:
+            print("[Live] Error: Not enough data fetched to form sequence.")
+            continue
+            
+        # We need the 3 most recently COMPLETED candles.
+        # Binance returns the last candle (index -1) as the currently OPEN candle.
+        # So completed candles are at indices -4, -3, -2 relative to list end (or just slice appropriately).
+        
+        # Get last 3 completed closes. 
+        # Index -2 is the one that just closed 5 seconds ago.
+        # Index -3 is T-1
+        # Index -4 is T-2
+        
+        try:
+            # Taking the slice 0:-1 drops the currently open candle
+            completed_df = df_live.iloc[:-1].tail(3).copy()
+            
+            if len(completed_df) < 3:
+                print("[Live] Error: Insufficient completed history.")
+                continue
+
+            closes = completed_df['close'].values
+            
+            # 3. Rounding
+            rounded_closes = ((closes / GLOBAL_GRID_SIZE).round() * GLOBAL_GRID_SIZE).round(GLOBAL_PRECISION)
+            
+            t_2 = rounded_closes[0]
+            t_1 = rounded_closes[1]
+            t_0 = rounded_closes[2] # The candle that just closed
+            
+            seq = (t_2, t_1, t_0)
+            
+            # 4. Predict
+            prediction = GLOBAL_MODEL.get(seq, 'FLAT') # Default to FLAT if unknown seq
+            
+            # 5. Log
+            last_close_time = completed_df['open_time'].iloc[-1] # This is the open time of the candle that just closed
+            save_live_prediction(last_close_time, closes[-1], seq, prediction)
+            
+            print(f"[Live] Candle Closed: {closes[-1]}")
+            print(f"[Live] Sequence: {seq}")
+            print(f"[Live] Prediction for next candle: {prediction}")
+            
+        except Exception as e:
+            print(f"[Live] Error during processing: {e}")
+
+# ---------------------------------------------------------
 # Execution
 # ---------------------------------------------------------
 if __name__ == "__main__":
+    # 1. Backtest & Optimization
     df_main = fetch_binance_data(SYMBOL, INTERVAL, START_TIME, END_TIME)
     
     if df_main.empty:
         print("No data fetched. Exiting.")
         sys.exit(1)
         
-    # Run Grid Search
     best_result = run_grid_search(df_main)
+    GLOBAL_BEST_RESULT = best_result
+    GLOBAL_GRID_SIZE = best_result['grid_size']
+    GLOBAL_PRECISION = best_result['needed_precision']
     
-    # Store in global variables for the request handler
-    global_best_result = best_result
+    # 2. Re-train full model for live use
+    # We use the whole dataset (no train/test split) to have maximum knowledge for live predictions
+    print("Training final model for live use...")
+    GLOBAL_MODEL = train_model(df_main, GLOBAL_GRID_SIZE, GLOBAL_PRECISION)
     
+    # 3. Generate Plot
     print("Generating plot for best result...")
-    global_plot_b64 = create_plot(
+    GLOBAL_PLOT_B64 = create_plot(
         df_main, 
         best_result['test_results'], 
         best_result['accuracy'], 
@@ -485,12 +628,17 @@ if __name__ == "__main__":
         best_result['grid_percent']
     )
     
-    print(f"Starting server on port {PORT}...")
+    # 4. Start Server in a separate thread
+    server_thread = threading.Thread(target=lambda: socketserver.TCPServer(("", PORT), BacktestHandler).serve_forever())
+    server_thread.daemon = True # Daemon thread exits when main program exits
+    server_thread.start()
+    
+    print(f"Server running at http://localhost:{PORT}")
     print(f"Open your browser at http://localhost:{PORT}")
     
-    with socketserver.TCPServer(("", PORT), BacktestHandler) as httpd:
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nServer stopped.")
-            httpd.server_close()
+    # 5. Enter Live Loop (Main Thread)
+    try:
+        live_loop()
+    except KeyboardInterrupt:
+        print("\nStopping...")
+        sys.exit(0)
