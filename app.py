@@ -171,6 +171,7 @@ def run_backtest(deriv_rules, norm_rules, test_df):
     highs = test_df['high'].values
     lows = test_df['low'].values
     closes = test_df['close'].values
+    timestamps = test_df.index
     
     cumulative_pnl = 0.0
     wins = 0
@@ -231,10 +232,13 @@ def run_backtest(deriv_rules, norm_rules, test_df):
             pnl_history.append(cumulative_pnl)
             dates.append(test_df.index[i+1])
             
-            # Format Input sequence string (Visualizing the Derivative sequence for consistency)
+            # --- Capture Raw OHLC for the INPUT SEQUENCE (3 candles) ---
+            # Indices for input candles are: i-2, i-1, i (since SEQ_LEN=3)
+            # We iterate k from 0 to SEQ_LEN-1 to get the exact 3 candles used for the pattern
             input_candles_str = ""
             for k in range(SEQ_LEN):
                 idx = i - SEQ_LEN + 1 + k
+                # Fetch raw OHLC values
                 c_o = opens[idx]
                 c_h = highs[idx]
                 c_l = lows[idx]
@@ -352,8 +356,11 @@ def home():
             /* Table formatting */
             td {{ vertical-align: middle !important; font-size: 0.85rem; }}
             
-            /* Make the input sequence column slightly wider/smaller text to fit 3 lines */
+            /* Ensure the multiline input sequence displays correctly */
             td small {{ display: block; line-height: 1.2; }}
+            
+            /* Style for the Input Sequence Column explicitly if needed */
+            table tr td:nth-child(2) {{ font-family: monospace; font-size: 0.75rem; white-space: nowrap; }}
         </style>
     </head>
     <body>
