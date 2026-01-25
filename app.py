@@ -202,14 +202,20 @@ def evaluate_strategy(df_original, grid_percent, verbose=False):
         prediction = model.get(seq, 'FLAT') 
         actual = row['target_direction']
         
-        if prediction == actual:
-            correct_predictions += 1
-        total_predictions += 1
+        # --- ACCURACY CALCULATION LOGIC ---
+        # Ignore if Prediction is FLAT or Actual Outcome is FLAT
+        if prediction != 'FLAT' and actual != 'FLAT':
+            if prediction == actual:
+                correct_predictions += 1
+            total_predictions += 1
         
         curr_price = row['close']
         next_price = row['next_close_raw']
         
         trade_pnl = 0.0
+        # PnL logic remains: we trade if prediction is UP/DOWN. 
+        # If prediction was UP but actual was FLAT, we likely lose a small amount (spread/noise) 
+        # or gain small amount, calculated by raw price diff.
         if prediction == 'UP':
             trade_pnl = next_price - curr_price
         elif prediction == 'DOWN':
@@ -321,7 +327,7 @@ HTML_TEMPLATE = """
             <strong>End:</strong> {end} <br>
             <strong>Optimized Grid:</strong> <span class="highlight">{grid_percent:.2f}%</span> (Size: {grid_size}) <br>
             <strong>Sharpe Ratio:</strong> <span class="highlight">{sharpe:.4f}</span> |
-            <strong>Accuracy:</strong> {accuracy:.2f}% | 
+            <strong>Directional Accuracy:</strong> {accuracy:.2f}% (Excl. Flat) | 
             <strong>Total PnL:</strong> {pnl} USDT
         </div>
 
