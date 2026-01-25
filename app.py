@@ -154,6 +154,8 @@ def run_backtest(prediction_rules, test_df):
 
     d_data = test_df[['d_open', 'd_high', 'd_low', 'd_close']].values
     opens = test_df['open'].values
+    highs = test_df['high'].values
+    lows = test_df['low'].values
     closes = test_df['close'].values
     
     cumulative_pnl = 0.0
@@ -170,8 +172,15 @@ def run_backtest(prediction_rules, test_df):
         
         pred = prediction_rules.get(seq, 'FLAT')
         
+        # Trade happens on candle i+1
         entry_price = opens[i+1]
         exit_price = closes[i+1]
+        
+        # Capture raw OHLC for verification
+        raw_o = entry_price
+        raw_h = highs[i+1]
+        raw_l = lows[i+1]
+        raw_c = exit_price
         
         trade_pnl = 0.0
         
@@ -188,8 +197,12 @@ def run_backtest(prediction_rules, test_df):
             pnl_history.append(cumulative_pnl)
             dates.append(test_df.index[i+1])
             
+            # Format Raw OHLC for table
+            raw_ohlc_str = f"O:{raw_o:.2f} H:{raw_h:.2f} L:{raw_l:.2f} C:{raw_c:.2f}"
+            
             results.append({
                 'timestamp': test_df.index[i+1],
+                'raw_trade_ohlc': raw_ohlc_str,
                 'prediction': pred,
                 'pnl': round(trade_pnl * 100, 2),
                 'cum_pnl': round(cumulative_pnl * 100, 2)
@@ -209,8 +222,6 @@ def generate_charts(df, pnl_dates, pnl_history):
     
     # 1. Normalized Raw OHLC (Rounded)
     norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
-    # Plotting only the last 500 points for clarity if dataset is large, or full if small
-    # For full context we plot all, but with thin lines
     plot_data = df[norm_cols]
     ax1.plot(plot_data.index, plot_data['n_close'], label='Norm Close', linewidth=1)
     ax1.set_title('Normalized OHLC (Close Price, Rounded)')
@@ -255,10 +266,8 @@ def main_logic():
     plot_url = generate_charts(df, dates, pnl_curve)
     
     # Format Top 10 Sequence Table
-    # Convert tuple sequences to string for display
     formatted_seq = []
     for item in top_seq:
-        # Format the numbers in the sequence for readability
         seq_str = ', '.join([f"{x:.3f}" for x in item['sequence']])
         formatted_seq.append({
             'sequence': f"<small>{seq_str}</small>",
@@ -273,7 +282,8 @@ def main_logic():
     report_data['plot'] = plot_url
     report_data['top_sequences'] = seq_df.to_html(classes='table table-bordered table-sm', escape=False, index=False)
     if not results_df.empty:
-        report_data['table'] = results_df.tail(20).to_html(classes='table table-striped', index=False)
+        # Added table-sm to help fit the new column
+        report_data['table'] = results_df.tail(20).to_html(classes='table table-striped table-sm', index=False)
     else:
         report_data['table'] = "<p>No trades executed in test set.</p>"
 
@@ -290,6 +300,8 @@ def home():
         <style>
             body{{ padding: 20px; }}
             .chart-container {{ margin-bottom: 30px; }}
+            /* Ensure the raw OHLC column doesn't break layout too much */
+            td {{ vertical-align: middle !important; font-size: 0.9rem; }}
         </style>
     </head>
     <body>
