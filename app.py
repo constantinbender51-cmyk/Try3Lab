@@ -1,4 +1,4 @@
-import ccxt
+import requests
 import pandas as pd
 import numpy as np
 import time
@@ -36,34 +36,102 @@ app = Flask(__name__)
 
 # --- Functions ---
 
-def fetch(timeframe, symbol, start, end):
-    print(f"Fetching data for {symbol} ({timeframe})...")
-    exchange = ccxt.binance({'enableRateLimit': True})
-    start_ts = exchange.parse8601(start) if start else None
-    end_ts = exchange.parse8601(end) if end else exchange.milliseconds()
+def fetch(timeframe, symbol, start_str, end_str):
+    """
+    Fetches OHLCV data using requests from Binance API v3.
+    """
+    print(f"Fetching data for {symbol} ({timeframe}) via requests...")
     
-    all_ohlcv = []
-    since = start_ts
+    # 1. Prepare Symbol and Time
+    api_symbol = symbol.replace('/', '') # BTC/USDT -> BTCUSDT
+    base_url = 'https://api.binance.com/api/v3/klines'
     
-    while since < end_ts:
+    # Parse Start Time
+    if start_str:
+        dt_obj = datetime.strptime(start_str, '%Y-%m-%d %H:%M:%S')
+        start_ts = int(dt_obj.timestamp() * 1000)
+    else:
+        # Default to 24h ago if no start provided (safety)
+        start_ts = int((datetime.now() - timedelta(days=1)).timestamp() * 1000)
+        
+    # Parse End Time
+    if end_str:
+        dt_end = datetime.strptime(end_str, '%Y-%m-%d %H:%M:%S')
+        end_ts = int(dt_end.timestamp() * 1000)
+    else:
+        end_ts = int(time.time() * 1000)
+        
+    all_data = []
+    current_start = start_ts
+    
+    # 2. Pagination Loop
+    while current_start < end_ts:
+        params = {
+            'symbol': api_symbol,
+            'interval': timeframe,
+            'startTime': current_start,
+            'limit': 1000
+        }
+        
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
-            if not ohlcv: break
+            response = requests.get(base_url, params=params)
+            data = response.json()
             
+            # Check for API errors
+            if isinstance(data, dict) and 'code' in data:
+                print(f"API Error: {data}")
+                break
+            
+            if not data:
+                break
+                
             # --- PRINT API RESPONSE HERE ---
-            print(f"DEBUG: Sample Binance API Response (First Candle in Batch): {ohlcv[0]}")
+            if current_start == start_ts:
+                print(f"DEBUG: Sample Binance API Response (First Candle): {data[0]}")
             # -------------------------------
             
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
-            time.sleep(0.1)
+            all_data.extend(data)
+            
+            # Update start time: Last candle close time + 1ms (index 6 is Close Time in Binance raw)
+            # Or just Open Time (index 0) + duration. Safer to take last open time + duration or just last item
+            # Binance klines: [Open Time, Open, High, Low, Close, Vol, Close Time, ...]
+            last_open_time = data[-1][0]
+            
+            # Advance based on timeframe to avoid overlaps or gaps, or just use last returned time + 1
+            # Reliable method: take the close time of the last candle + 1
+            current_start = data[-1][6] + 1
+            
+            # Break if we exceeded end_ts (though API handles this, good to be explicit)
+            if data[-1][0] >= end_ts:
+                break
+                
+            time.sleep(0.1) # Respect rate limits
+            
         except Exception as e:
             print(f"Error fetching: {e}")
             break
-            
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # 3. Convert to DataFrame
+    # Binance columns: Open Time, Open, High, Low, Close, Volume, ...
+    # We need: timestamp, open, high, low, close, volume
+    if not all_data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_data, columns=[
+        'timestamp', 'open', 'high', 'low', 'close', 'volume', 
+        'close_time', 'quote_asset_vol', 'trades', 'tb_base_vol', 'tb_quote_vol', 'ignore'
+    ])
+    
+    # Cast to numeric
+    cols = ['open', 'high', 'low', 'close', 'volume']
+    df[cols] = df[cols].apply(pd.to_numeric, axis=1)
+    
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-    if end: df = df[df['timestamp'] <= end_ts]
+    
+    # Filter by strict end time if provided
+    if end_str:
+        df = df[df['timestamp'] <= end_ts]
+        
     return df
 
 def deriveround(df):
@@ -260,6 +328,7 @@ def live_loop_thread():
             if wait_seconds < 0: wait_seconds = 0
             time.sleep(wait_seconds)
             
+            # Use requests fetch
             raw_df = fetch(TIMEFRAME, SYMBOL, None, None)
             if raw_df.empty: continue
             derived_df = deriveround(raw_df)
@@ -353,7 +422,7 @@ def dashboard():
     </style>
     </head>
     <body>
-        <h1>Bot Status: {SYMBOL} {TIMEFRAME}</h1>
+        <h1>Bot Status: {SYMBOL} {TIMEFRAME} (Requests Lib)</h1>
         <div>
             <b>Backtest Accuracy:</b> {acc:.2%} ({total} trades)<br>
             <b>Current Prediction:</b> {current_prediction.get('prediction','N/A')} @ {current_prediction.get('entry',0)}
