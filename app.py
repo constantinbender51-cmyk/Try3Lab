@@ -14,12 +14,12 @@ from datetime import datetime, timedelta
 # --- Parameters ---
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-START_STR = '2024-01-01 00:00:00' 
+START_STR = '2026-01-01 00:00:00' 
 END_STR = None 
 B_SPLIT = 0.70
-C_TOP = 0.20
-D_LEN = 3
-E_SIM = 0.5
+C_TOP = 0.20 # Unused now
+D_LEN = 4 
+E_SIM = 0.5 # Adjusted for Sum of Absolute Differences (SAD). 0.5 is a reasonable cumulative error threshold for pct changes.
 API_PORT = 8080
 
 # Global state
@@ -27,8 +27,7 @@ live_log = []
 current_prediction = {}
 backtest_results = []
 recent_perf_results = []
-model_patterns_seqs = np.array([]) 
-model_patterns_meta = [] 
+train_sequences = np.array([]) # The "Library" of history (Split 1)
 debug_logs = [] 
 raw_plot_url = ""
 derived_plot_url = ""
@@ -38,11 +37,7 @@ app = Flask(__name__)
 # --- Functions ---
 
 def fetch(timeframe, symbol, start_str, end_str):
-    """
-    Fetches OHLCV data using requests from Binance API v3.
-    """
     print(f"Fetching data for {symbol} ({timeframe}) via requests...")
-    
     api_symbol = symbol.replace('/', '')
     base_url = 'https://api.binance.com/api/v3/klines'
     
@@ -62,38 +57,21 @@ def fetch(timeframe, symbol, start_str, end_str):
     current_start = start_ts
     
     while current_start < end_ts:
-        params = {
-            'symbol': api_symbol,
-            'interval': timeframe,
-            'startTime': current_start,
-            'limit': 1000
-        }
-        
+        params = {'symbol': api_symbol, 'interval': timeframe, 'startTime': current_start, 'limit': 1000}
         try:
             response = requests.get(base_url, params=params)
             data = response.json()
-            
-            if isinstance(data, dict) and 'code' in data:
-                print(f"API Error: {data}")
-                break
-            
-            if not data:
-                break
-                
+            if isinstance(data, dict) and 'code' in data: break
+            if not data: break
             all_data.extend(data)
             current_start = data[-1][6] + 1
-            
-            if data[-1][0] >= end_ts:
-                break
-                
+            if data[-1][0] >= end_ts: break
             time.sleep(0.05) 
-            
         except Exception as e:
             print(f"Error fetching: {e}")
             break
     
-    if not all_data:
-        return pd.DataFrame()
+    if not all_data: return pd.DataFrame()
 
     df = pd.DataFrame(all_data, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume', 
@@ -104,9 +82,7 @@ def fetch(timeframe, symbol, start_str, end_str):
     df[cols] = df[cols].apply(pd.to_numeric, axis=1)
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     
-    if end_str:
-        df = df[df['timestamp'] <= end_ts]
-        
+    if end_str: df = df[df['timestamp'] <= end_ts]
     return df
 
 def deriveround(df):
@@ -127,135 +103,94 @@ def split(df, b):
 
 def create_sequences(data, d):
     n_samples = len(data) - d + 1
-    if n_samples <= 0:
-        return np.array([])
-    
+    if n_samples <= 0: return np.array([])
     window_shape = (n_samples, d, data.shape[1])
     window_strides = (data.strides[0], data.strides[0], data.strides[1])
-    
-    sequences = np.lib.stride_tricks.as_strided(
-        data, shape=window_shape, strides=window_strides, writeable=False
-    )
+    sequences = np.lib.stride_tricks.as_strided(data, shape=window_shape, strides=window_strides, writeable=False)
     return sequences.copy()
 
-def gettop(train_df, c, d, e):
-    print("Mining top patterns (Full N x N Vectorized)...")
-    cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
-    data_values = train_df[cols].values.astype(np.float32)
-    
-    seq_arr = create_sequences(data_values, d)
-    n = len(seq_arr)
-    if n == 0: return [], np.array([])
-    
-    # --- LIMIT REMOVED ---
-    # We now score ALL sequences against ALL sequences.
-    scores = np.zeros(n, dtype=int)
-    
-    print(f"Scoring all {n} sequences against full history (Total ops: {n}x{n})...")
-    
-    flat_seqs = seq_arr.reshape(n, -1)
-    
-    # Iterate through EVERY sequence
-    for i in range(n):
-        if i % 100 == 0: print(f"Scoring {i}/{n} ({(i/n)*100:.1f}%)", end='\r')
-        
-        target_vec = flat_seqs[i] 
-        
-        with np.errstate(divide='ignore', invalid='ignore'):
-            safe_target = np.where(np.abs(target_vec) < 1e-9, 1e-9, target_vec)
-            diffs = np.abs((flat_seqs - target_vec) / safe_target)
-            
-            zero_mask = (np.abs(target_vec) < 1e-9)
-            if np.any(zero_mask):
-                diffs[:, zero_mask] = np.abs(flat_seqs[:, zero_mask])
-            
-            matches = np.all(diffs < e, axis=1)
-            
-            # Subtract 1 to remove self-match
-            scores[i] = np.sum(matches) - 1
-            if scores[i] < 0: scores[i] = 0
+def find_best_match_vote(target_seq, history_seqs, e_threshold):
+    """
+    1. Calculates Sum of Absolute Differences (SAD) between target and all history.
+    2. Filters those < e_threshold.
+    3. Votes on outcome (Next Candle Close Change) based on matches.
+    """
+    if len(history_seqs) == 0: return 0, 0, 0
 
-    print("\nScoring complete.")
+    # History Seqs shape: (N, D, 4)
+    # Target Seq shape: (D-1, 4) (Needs to be compared to first D-1 of history)
+    
+    beg_len = len(target_seq)
+    history_begs = history_seqs[:, :beg_len, :] # (N, beg_len, 4)
+    
+    # --- 1. Calculate SAD (Sum of Absolute Differences) ---
+    # target_seq must be broadcasted
+    # diffs shape: (N, beg_len, 4)
+    diffs = np.abs(history_begs - target_seq)
+    
+    # Sum over length and features to get one score per history item
+    # axis=(1,2) sums the inner window and features
+    scores = np.sum(diffs, axis=(1, 2)) # Shape (N,)
+    
+    # --- 2. Filter ---
+    match_mask = scores < e_threshold
+    match_indices = np.where(match_mask)[0]
+    
+    if len(match_indices) == 0:
+        return 0, 0, 0 # No matches found
+    
+    # --- 3. Vote on Outcome ---
+    # Get outcomes of matching sequences (Last candle, Close% is index 3)
+    outcomes = history_seqs[match_indices, -1, 3]
+    
+    longs = np.sum(outcomes > 0)
+    shorts = np.sum(outcomes < 0)
+    
+    # Calculate probability of the dominant direction
+    total_matches = len(outcomes)
+    
+    if longs > shorts:
+        prob = longs / total_matches
+        return 1, prob, total_matches
+    elif shorts > longs:
+        prob = shorts / total_matches
+        return -1, prob, total_matches
+    else:
+        return 0, 0, total_matches
 
-    scored_patterns = []
-    for i in range(n):
-        scored_patterns.append({
-            'sequence': seq_arr[i], 
-            'score': scores[i],
-            'orig_idx': i
-        })
-        
-    scored_patterns.sort(key=lambda x: x['score'], reverse=True)
-    
-    top_n = int(len(scored_patterns) * c)
-    if top_n < 1: top_n = 1
-    
-    top_items = scored_patterns[:top_n]
-    top_seqs_array = np.array([p['sequence'] for p in top_items])
-    
-    return top_items, top_seqs_array
-
-def completesimilarbeginnings(target_df, model_patterns_arr, d, e, raw_df=None, collect_debug=False):
-    if len(model_patterns_arr) == 0: return []
-    
+def backtest_logic(target_df, training_library, d, e, raw_df=None, collect_debug=False):
     results = []
     cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
     data_values = target_df[cols].values.astype(np.float32)
     beg_len = d - 1
     
-    target_seqs = create_sequences(data_values, beg_len)
-    flat_targets = target_seqs.reshape(len(target_seqs), -1)
-    
-    model_begs = model_patterns_arr[:, :beg_len, :].reshape(len(model_patterns_arr), -1)
-    model_outcomes = model_patterns_arr[:, -1, 3]
+    # Create windows for the target dataset
+    target_seqs = create_sequences(data_values, beg_len) # Shape (M, beg_len, 4)
     
     global debug_logs
-    if collect_debug:
-        debug_logs = []
+    if collect_debug: debug_logs = []
 
-    num_steps = len(flat_targets)
-    
-    for i in range(num_steps):
-        target_vec = flat_targets[i]
+    print(f"Backtesting {len(target_seqs)} candles against {len(training_library)} history patterns...")
+
+    for i in range(len(target_seqs)):
+        if i % 100 == 0: print(f"Step {i}/{len(target_seqs)}", end='\r')
         
-        with np.errstate(divide='ignore', invalid='ignore'):
-            safe_target = np.where(np.abs(target_vec) < 1e-9, 1e-9, target_vec)
-            diffs = np.abs((model_begs - target_vec) / safe_target)
-            
-            zero_mask = (np.abs(target_vec) < 1e-9)
-            if np.any(zero_mask):
-                diffs[:, zero_mask] = np.abs(model_begs[:, zero_mask])
-                
-            matches = np.all(diffs < e, axis=1)
+        current_seq = target_seqs[i]
         
-        match_indices = np.where(matches)[0]
-        prediction = 0
+        # Perform Search & Vote
+        direction, probability, match_count = find_best_match_vote(current_seq, training_library, e)
         
+        # Debugging
         if collect_debug and len(debug_logs) < 3:
-            iter_log = {
-                'iteration': i, 
-                'input': target_seqs[i].tolist(), 
-                'matches': [],
-                'found_match': False
-            }
-            for m_idx in match_indices[:3]:
-                iter_log['matches'].append({
-                    'pattern_idx': int(m_idx),
-                    'match': True
-                })
-            
-            if len(match_indices) > 0:
-                iter_log['found_match'] = True
-            debug_logs.append(iter_log)
+            debug_logs.append({
+                'iteration': i,
+                'input': current_seq.tolist(),
+                'found_matches': int(match_count),
+                'vote_direction': direction,
+                'probability': float(probability)
+            })
 
-        if len(match_indices) > 0:
-            first_match_idx = match_indices[0]
-            close_change = model_outcomes[first_match_idx]
-            
-            if close_change > 0: prediction = 1
-            elif close_change < 0: prediction = -1
-        
-        if prediction != 0:
+        if direction != 0:
             outcome_idx = i + beg_len
             if outcome_idx < len(target_df):
                 entry_price = 0
@@ -269,18 +204,20 @@ def completesimilarbeginnings(target_df, model_patterns_arr, d, e, raw_df=None, 
                 
                 pnl = 0
                 if entry_price > 0:
-                    pnl = prediction * (exit_price - entry_price) / entry_price
+                    pnl = direction * (exit_price - entry_price) / entry_price
                 
                 results.append({
                     'timestamp': target_df.iloc[outcome_idx]['datetime'],
                     'input_candles': raw_input_candles,
-                    'prediction': "LONG" if prediction == 1 else "SHORT",
+                    'prediction': "LONG" if direction == 1 else "SHORT",
+                    'probability': probability,
+                    'matches': match_count,
                     'entry': entry_price,
                     'exit': exit_price,
                     'outcome': "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "FLAT"),
                     'pnl': pnl
                 })
-
+    print("\nBacktest Complete.")
     return results
 
 def get_accuracy_metrics(results):
@@ -294,7 +231,6 @@ def get_accuracy_metrics(results):
 
 def generate_static_plots(df, df_derived):
     if df.empty: return "", ""
-    
     with plot_lock:
         img = io.BytesIO()
         plt.figure(figsize=(10, 4))
@@ -321,7 +257,6 @@ def generate_static_plots(df, df_derived):
         img2.seek(0)
         derived_b64 = base64.b64encode(img2.getvalue()).decode()
         plt.close()
-
     return raw_b64, derived_b64
 
 # --- Threading & Live Logic ---
@@ -341,50 +276,34 @@ def live_loop_thread():
             if wait_seconds < 0: wait_seconds = 0
             time.sleep(wait_seconds)
             
+            # Fetch Live Data
             raw_df = fetch(TIMEFRAME, SYMBOL, None, None)
             if raw_df.empty: continue
             
             derived_df = deriveround(raw_df)
+            
+            # Get Current Sequence
             input_seq_df = derived_df.iloc[-(D_LEN): -1] 
             cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
+            current_seq = input_seq_df[cols].values.astype(np.float32) # Shape (D-1, 4)
             
-            current_seq = input_seq_df[cols].values.astype(np.float32)
-            flat_current = current_seq.flatten() 
+            # Search History (Split 1 Library)
+            pred_dir, prob, matches = find_best_match_vote(current_seq, train_sequences, E_SIM)
             
-            pred_dir = 0
-            
-            if len(model_patterns_seqs) > 0:
-                beg_len = D_LEN - 1
-                model_begs = model_patterns_seqs[:, :beg_len, :].reshape(len(model_patterns_seqs), -1)
-                
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    safe_target = np.where(np.abs(flat_current) < 1e-9, 1e-9, flat_current)
-                    diffs = np.abs((model_begs - flat_current) / safe_target)
-                    
-                    zero_mask = (np.abs(flat_current) < 1e-9)
-                    if np.any(zero_mask):
-                        diffs[:, zero_mask] = np.abs(model_begs[:, zero_mask])
-                    
-                    matches = np.all(diffs < E_SIM, axis=1)
-                
-                match_indices = np.where(matches)[0]
-                if len(match_indices) > 0:
-                    idx = match_indices[0]
-                    outcome = model_patterns_seqs[idx, -1, 3]
-                    if outcome > 0: pred_dir = 1
-                    elif outcome < 0: pred_dir = -1
-
             entry_price = raw_df.iloc[-1]['open']
             pred_obj = {
                 'timestamp': datetime.utcnow(),
                 'input_candles': raw_df.iloc[-(D_LEN): -1][['open','close']].values.tolist(),
                 'prediction': "LONG" if pred_dir == 1 else ("SHORT" if pred_dir == -1 else "FLAT"),
+                'probability': float(prob),
+                'matches': int(matches),
                 'entry': entry_price,
                 'status': 'OPEN',
                 'exit': None, 'pnl': 0
             }
             current_prediction = pred_obj
             
+            # Close previous prediction
             if len(live_log) > 0 and live_log[-1]['status'] == 'OPEN':
                 last = live_log[-1]
                 exit_price = raw_df.iloc[-2]['close'] 
@@ -398,6 +317,7 @@ def live_loop_thread():
             
             if pred_dir != 0: live_log.append(pred_obj)
             
+            # Prune
             two_weeks = 14 * 24 * 3600
             now_ts = datetime.utcnow().timestamp()
             live_log[:] = [x for x in live_log if (now_ts - x['timestamp'].timestamp()) < two_weeks]
@@ -433,11 +353,10 @@ def dashboard():
         plt.close()
     
     acc, total, _ = get_accuracy_metrics(backtest_results)
-    top_patterns_display = model_patterns_meta[:10]
     
     html = f"""
     <html>
-    <head><title>Trading Bot (Full Scan)</title>
+    <head><title>Trading Bot (Probability Vote)</title>
     <style>
         body {{ font-family: monospace; margin: 20px; }}
         h2 {{ border-bottom: 2px solid #ccc; padding-bottom: 5px; }}
@@ -452,10 +371,10 @@ def dashboard():
     </style>
     </head>
     <body>
-        <h1>Bot Status: {SYMBOL} {TIMEFRAME} (Full N x N)</h1>
+        <h1>Bot Status: {SYMBOL} {TIMEFRAME} (SAD Metric + Voting)</h1>
         <div>
             <b>Backtest Accuracy:</b> {acc:.2%} ({total} trades)<br>
-            <b>Current Prediction:</b> {current_prediction.get('prediction','N/A')} @ {current_prediction.get('entry',0)}
+            <b>Current Prediction:</b> {current_prediction.get('prediction','N/A')} (Prob: {current_prediction.get('probability',0):.2f})
         </div>
         
         <h2>1. Data Visualization</h2>
@@ -470,30 +389,24 @@ def dashboard():
             </div>
         </div>
 
-        <h2>2. Top 10 Model Patterns (Found {len(model_patterns_meta)})</h2>
+        <h2>2. Live Prediction Log</h2>
         <table>
-            <tr><th>Rank</th><th>Score (Freq)</th><th>Sequence Data</th></tr>
-            {''.join([f"<tr><td>{i+1}</td><td>{p['score']}</td><td><div class='code-block'>{p['sequence'].tolist()}</div></td></tr>" for i, p in enumerate(top_patterns_display)])}
+            <tr><th>Time</th><th>Pred</th><th>Matches</th><th>Prob</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>
+            {''.join([f"<tr><td>{r['timestamp']}</td><td>{r['prediction']}</td><td>{r.get('matches',0)}</td><td>{r.get('probability',0):.2f}</td><td>{r['entry']}</td><td>{r['exit']}</td><td class='{r.get('outcome','').lower()}'>{r.get('outcome','OPEN')}</td><td>{r['pnl']:.4f}</td></tr>" for r in reversed(live_log)])}
         </table>
 
-        <h2>3. Algorithm Logic Debug</h2>
+        <h2>3. Debug (First 3 Backtest Iterations)</h2>
         <div class="code-block">
         <pre>
-{''.join([f"ITERATION {l['iteration']}:\\n  Match: {l['found_match']}\\n  Checks: {l['matches']}\\n\\n" for l in debug_logs])}
+{''.join([f"ITERATION {l['iteration']}: Matches Found: {l['found_matches']} | Vote: {l['vote_direction']} | Prob: {l['probability']:.2f}\\n" for l in debug_logs])}
         </pre>
         </div>
 
-        <h2>4. Live Prediction Log</h2>
-        <table>
-            <tr><th>Time</th><th>Pred</th><th>Input Candles (O,C)</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>
-            {''.join([f"<tr><td>{r['timestamp']}</td><td>{r['prediction']}</td><td><div class='code-block'>{r['input_candles']}</div></td><td>{r['entry']}</td><td>{r['exit']}</td><td class='{r.get('outcome','').lower()}'>{r.get('outcome','OPEN')}</td><td>{r['pnl']:.4f}</td></tr>" for r in reversed(live_log)])}
-        </table>
-
-        <h2>5. Recent Performance (Last 14d)</h2>
+        <h2>4. Recent Performance (Last 14d)</h2>
         <img src="data:image/png;base64,{backtest_plot_url}" style="width:100%; max-width:1000px">
         <table>
-            <tr><th>Time</th><th>Pred</th><th>Input Candles (O, C)</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>
-             {''.join([f"<tr><td>{r['timestamp']}</td><td>{r['prediction']}</td><td><div class='code-block'>{r['input_candles']}</div></td><td>{r['entry']}</td><td>{r['exit']}</td><td class='{r['outcome'].lower()}'>{r['outcome']}</td><td>{r['pnl']:.4f}</td></tr>" for r in reversed(recent_perf_results)])}
+            <tr><th>Time</th><th>Pred</th><th>Matches</th><th>Prob</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>
+             {''.join([f"<tr><td>{r['timestamp']}</td><td>{r['prediction']}</td><td>{r['matches']}</td><td>{r['probability']:.2f}</td><td>{r['entry']}</td><td>{r['exit']}</td><td class='{r['outcome'].lower()}'>{r['outcome']}</td><td>{r['pnl']:.4f}</td></tr>" for r in reversed(recent_perf_results)])}
         </table>
     </body>
     </html>
@@ -505,44 +418,52 @@ def api_endpoint():
     return jsonify({
         'current_prediction': current_prediction,
         'live_log': live_log,
-        'top_patterns': [{'score': int(x['score']), 'seq': x['sequence'].tolist()} for x in model_patterns_meta[:10]],
         'debug_logs': debug_logs
     })
 
 def main():
-    global model_patterns_meta, model_patterns_seqs, backtest_results, recent_perf_results
+    global train_sequences, backtest_results, recent_perf_results
     global raw_plot_url, derived_plot_url
     
+    # 1. Fetch
     df = fetch(TIMEFRAME, SYMBOL, START_STR, END_STR)
     if df.empty:
         print("No data fetched! Check dates or network.")
         return
     print(f"Data fetched: {len(df)} rows.")
 
+    # 2. Derive & Plot
     df_derived = deriveround(df)
-    
     raw_plot_url, derived_plot_url = generate_static_plots(df, df_derived)
     
+    # 3. Split
     train_df, test_df = split(df_derived, B_SPLIT)
     train_raw, test_raw = split(df, B_SPLIT)
     
-    # Calls the Uncapped Version
-    model_patterns_meta, model_patterns_seqs = gettop(train_df, C_TOP, D_LEN, E_SIM)
+    # 4. Create Library (Split 1)
+    print("Building Training Library (Split 1)...")
+    cols = ['open_pct', 'high_pct', 'low_pct', 'close_pct']
+    train_data = train_df[cols].values.astype(np.float32)
+    train_sequences = create_sequences(train_data, D_LEN)
+    print(f"Library created with {len(train_sequences)} patterns.")
     
+    # 5. Backtest (Split 2 vs Split 1)
     print("Running Backtest...")
-    backtest_results = completesimilarbeginnings(test_df, model_patterns_seqs, D_LEN, E_SIM, test_raw, collect_debug=True)
+    backtest_results = backtest_logic(test_df, train_sequences, D_LEN, E_SIM, test_raw, collect_debug=True)
     
+    # 6. Recent Performance
     print("Calculating Recent Performance...")
     two_weeks_ago = datetime.utcnow() - timedelta(days=14)
     if df['datetime'].max() > two_weeks_ago:
         mask = df['datetime'] > two_weeks_ago
-        recent_perf_results = completesimilarbeginnings(df_derived[mask], model_patterns_seqs, D_LEN, E_SIM, df[mask])
+        recent_perf_results = backtest_logic(df_derived[mask], train_sequences, D_LEN, E_SIM, df[mask])
     else:
         recent_perf_results = []
     
     acc, _, _ = get_accuracy_metrics(backtest_results)
     print(f"Backtest Accuracy: {acc:.2%}")
     
+    # 7. Start Live Loop
     t = threading.Thread(target=live_loop_thread)
     t.daemon = True
     t.start()
