@@ -30,43 +30,49 @@ def ensure_dir(directory):
 def fetch_data():
     ensure_dir(DATA_DIR)
     
+    # --- FORCE DATA REFRESH ---
     if os.path.exists(DATA_FILE):
-        print("Loading data from disk...")
-        df = pd.read_csv(DATA_FILE, index_col=0, parse_dates=True)
-    else:
-        print(f"Fetching data from Binance ({START_DATE} to {END_DATE})...")
-        exchange = ccxt.binance()
-        
-        since = int(pd.Timestamp(START_DATE).timestamp() * 1000)
-        end_ts = int(pd.Timestamp(END_DATE).timestamp() * 1000)
-        
-        all_candles = []
-        
-        while since < end_ts:
-            try:
-                ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
-                if not ohlcv: break
-                
-                all_candles.extend(ohlcv)
-                last_timestamp = ohlcv[-1][0]
-                since = last_timestamp + 1 
-                
-                if last_timestamp >= end_ts: break
-                print(f"Fetched up to {pd.to_datetime(last_timestamp, unit='ms')}")
-                
-            except Exception as e:
-                print(f"Error fetching data: {e}")
+        print(f"Removing cached data file {DATA_FILE} to force fresh fetch...")
+        os.remove(DATA_FILE)
+    
+    print(f"Fetching fresh data for {SYMBOL} from Binance ({START_DATE} to {END_DATE})...")
+    exchange = ccxt.binance({'enableRateLimit': True}) 
+    
+    since = int(pd.Timestamp(START_DATE).timestamp() * 1000)
+    end_ts = int(pd.Timestamp(END_DATE).timestamp() * 1000)
+    
+    all_candles = []
+    
+    while since < end_ts:
+        try:
+            # Fetch Spot Data
+            ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
+            if not ohlcv: 
+                print("No more data received.")
                 break
+            
+            all_candles.extend(ohlcv)
+            last_timestamp = ohlcv[-1][0]
+            since = last_timestamp + 1 
+            
+            if last_timestamp >= end_ts: break
+            
+            if len(all_candles) % 5000 == 0:
+                print(f"Fetched up to {pd.to_datetime(last_timestamp, unit='ms')}")
+            
+        except Exception as e:
+            print(f"Error fetching data: {e}")
+            break
 
-        df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        
-        mask = (df.index >= pd.Timestamp(START_DATE)) & (df.index < pd.Timestamp(END_DATE))
-        df = df.loc[mask]
-        
-        df.to_csv(DATA_FILE)
-        print(f"Saved {len(df)} rows to {DATA_FILE}")
+    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    
+    mask = (df.index >= pd.Timestamp(START_DATE)) & (df.index < pd.Timestamp(END_DATE))
+    df = df.loc[mask]
+    
+    df.to_csv(DATA_FILE)
+    print(f"Successfully saved {len(df)} fresh rows to {DATA_FILE}")
         
     return df
 
@@ -90,12 +96,7 @@ def prepare_data(df):
     return df
 
 def train_model(train_df, input_cols):
-    """
-    Helper function to train a prediction map for a specific set of input columns.
-    """
     pattern_map = {}
-    
-    # Extract data for the specific columns
     data_values = train_df[input_cols].values
     train_outcomes = (train_df['close'].shift(-1) - train_df['close']) / train_df['close']
     
@@ -115,7 +116,6 @@ def train_model(train_df, input_cols):
         pattern_map[seq][label] += 1
         pattern_map[seq]['total'] += 1
         
-    # Generate Rules
     prediction_rules = {}
     sequence_stats = []
 
@@ -139,7 +139,6 @@ def build_sequences_and_predict(df):
     if len(df) < SEQ_LEN:
         return {}, {}, df, []
 
-    # Split Train/Test
     split_idx = int(len(df) * 0.8)
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
@@ -152,7 +151,6 @@ def build_sequences_and_predict(df):
     norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
     norm_rules, norm_stats = train_model(train_df, norm_cols)
 
-    # Sort stats by frequency (using derivative model for display purposes)
     deriv_stats.sort(key=lambda x: x['total_count'], reverse=True)
     top_10_sequences = deriv_stats[:10]
 
@@ -163,7 +161,6 @@ def run_backtest(deriv_rules, norm_rules, test_df):
     if len(test_df) < SEQ_LEN:
         return pd.DataFrame(), {}, [], []
 
-    # Prepare data arrays for both models
     d_data = test_df[['d_open', 'd_high', 'd_low', 'd_close']].values
     n_data = test_df[['n_open', 'n_high', 'n_low', 'n_close']].values
     
@@ -195,12 +192,10 @@ def run_backtest(deriv_rules, norm_rules, test_df):
         # 3. Apply Consensus/Conflict Logic
         final_pred = 'FLAT'
         
-        # Conflict check: UP vs DOWN or DOWN vs UP
         if (pred_deriv == 'UP' and pred_norm == 'DOWN') or \
            (pred_deriv == 'DOWN' and pred_norm == 'UP'):
-            final_pred = 'FLAT' # Conflict -> No Trade
+            final_pred = 'FLAT' 
         else:
-            # If no conflict, we take the active direction if either has one
             if pred_deriv == 'UP' or pred_norm == 'UP':
                 final_pred = 'UP'
             elif pred_deriv == 'DOWN' or pred_norm == 'DOWN':
@@ -208,7 +203,7 @@ def run_backtest(deriv_rules, norm_rules, test_df):
             else:
                 final_pred = 'FLAT'
 
-        # --- Trade Execution Logic (Trade happens on candle i+1) ---
+        # --- Trade Execution Logic ---
         entry_price = opens[i+1]
         exit_price = closes[i+1]
         
@@ -232,13 +227,9 @@ def run_backtest(deriv_rules, norm_rules, test_df):
             pnl_history.append(cumulative_pnl)
             dates.append(test_df.index[i+1])
             
-            # --- Capture Raw OHLC for the INPUT SEQUENCE (3 candles) ---
-            # Indices for input candles are: i-2, i-1, i (since SEQ_LEN=3)
-            # We iterate k from 0 to SEQ_LEN-1 to get the exact 3 candles used for the pattern
             input_candles_str = ""
             for k in range(SEQ_LEN):
                 idx = i - SEQ_LEN + 1 + k
-                # Fetch timestamp and raw OHLC values
                 ts = timestamps[idx]
                 ts_str = ts.strftime('%Y-%m-%d %H:%M')
                 
@@ -246,7 +237,6 @@ def run_backtest(deriv_rules, norm_rules, test_df):
                 c_h = highs[idx]
                 c_l = lows[idx]
                 c_c = closes[idx]
-                # Added timestamp to the string
                 input_candles_str += f"[{k+1}] {ts_str} | O:{c_o:.0f} H:{c_h:.0f} L:{c_l:.0f} C:{c_c:.0f}<br>"
 
             trade_ohlc_str = f"O:{trade_o:.0f} H:{trade_h:.0f} L:{trade_l:.0f} C:{trade_c:.0f}"
@@ -270,11 +260,64 @@ def run_backtest(deriv_rules, norm_rules, test_df):
     
     return pd.DataFrame(results), stats, dates, pnl_history
 
+def format_recent_data(df):
+    """
+    Extracts the last 10 rows and formats them into an HTML table
+    showing Raw (Binance), Normalized, and Derivative data.
+    """
+    recent = df.tail(10).copy()
+    
+    # Structure the HTML Manually for grouped headers
+    html = '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
+    html += '<thead class="thead-light">'
+    html += '<tr>'
+    html += '<th rowspan="2" style="vertical-align: middle;">Timestamp (UTC)</th>'
+    html += '<th colspan="4">Raw Binance Data (USD)</th>'
+    html += '<th colspan="4">Normalized (Rounded)</th>'
+    html += '<th colspan="4">Derivative % (Rounded)</th>'
+    html += '</tr>'
+    html += '<tr>'
+    html += '<th>Open</th><th>High</th><th>Low</th><th>Close</th>'
+    html += '<th>O</th><th>H</th><th>L</th><th>C</th>'
+    html += '<th>O</th><th>H</th><th>L</th><th>C</th>'
+    html += '</tr>'
+    html += '</thead>'
+    html += '<tbody>'
+    
+    for index, row in recent.iterrows():
+        ts_str = index.strftime('%Y-%m-%d %H:%M')
+        
+        # Raw Data (2 decimals)
+        r_o = f"{row['open']:.2f}"
+        r_h = f"{row['high']:.2f}"
+        r_l = f"{row['low']:.2f}"
+        r_c = f"{row['close']:.2f}"
+        
+        # Normalized (4 decimals)
+        n_o = f"{row['n_open']:.4f}"
+        n_h = f"{row['n_high']:.4f}"
+        n_l = f"{row['n_low']:.4f}"
+        n_c = f"{row['n_close']:.4f}"
+        
+        # Derivative (4 decimals)
+        d_o = f"{row['d_open']:.4f}"
+        d_h = f"{row['d_high']:.4f}"
+        d_l = f"{row['d_low']:.4f}"
+        d_c = f"{row['d_close']:.4f}"
+        
+        html += f"<tr>"
+        html += f"<td>{ts_str}</td>"
+        html += f"<td>{r_o}</td><td>{r_h}</td><td>{r_l}</td><td>{r_c}</td>"
+        html += f"<td>{n_o}</td><td>{n_h}</td><td>{n_l}</td><td>{n_c}</td>"
+        html += f"<td>{d_o}</td><td>{d_h}</td><td>{d_l}</td><td>{d_c}</td>"
+        html += f"</tr>"
+        
+    html += '</tbody></table>'
+    return html
+
 def generate_charts(df, pnl_dates, pnl_history):
-    # Create a figure with 3 subplots: Normalized, Derivative, PnL
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
     
-    # 1. Normalized Raw OHLC (Rounded)
     norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
     plot_data = df[norm_cols]
     ax1.plot(plot_data.index, plot_data['n_close'], label='Norm Close', linewidth=1)
@@ -282,7 +325,6 @@ def generate_charts(df, pnl_dates, pnl_history):
     ax1.legend()
     ax1.grid(True)
 
-    # 2. Derivative OHLC (Rounded)
     deriv_cols = ['d_open', 'd_high', 'd_low', 'd_close']
     plot_deriv = df[deriv_cols]
     ax2.plot(plot_deriv.index, plot_deriv['d_close'], label='Deriv Close', color='orange', linewidth=0.5)
@@ -290,7 +332,6 @@ def generate_charts(df, pnl_dates, pnl_history):
     ax2.legend()
     ax2.grid(True)
 
-    # 3. Strategy PnL
     if len(pnl_dates) > 1:
         ax3.plot(pnl_dates, pnl_history, label='Strategy PnL', color='green')
     else:
@@ -300,7 +341,6 @@ def generate_charts(df, pnl_dates, pnl_history):
     ax3.grid(True)
 
     plt.tight_layout()
-    
     img = io.BytesIO()
     plt.savefig(img, format='png')
     img.seek(0)
@@ -314,14 +354,15 @@ def main_logic():
     if df.empty: return
 
     df = prepare_data(df)
-    # Get rules for both models
+    
+    # --- Generate Recent Data Table ---
+    report_data['recent_data'] = format_recent_data(df)
+    
     deriv_rules, norm_rules, test_df, top_seq = build_sequences_and_predict(df)
-    # Pass both rule sets to backtest
     results_df, stats, dates, pnl_curve = run_backtest(deriv_rules, norm_rules, test_df)
     
     plot_url = generate_charts(df, dates, pnl_curve)
     
-    # Format Top 10 Sequence Table (Derivative)
     formatted_seq = []
     for item in top_seq:
         seq_str = ', '.join([f"{x:.3f}" for x in item['sequence']])
@@ -338,7 +379,6 @@ def main_logic():
     report_data['plot'] = plot_url
     report_data['top_sequences'] = seq_df.to_html(classes='table table-bordered table-sm', escape=False, index=False)
     if not results_df.empty:
-        # Pass escape=False so the <br> tags in input_sequence_raw are rendered
         report_data['table'] = results_df.tail(20).to_html(classes='table table-striped table-sm', index=False, escape=False)
     else:
         report_data['table'] = "<p>No trades executed in test set.</p>"
@@ -356,14 +396,8 @@ def home():
         <style>
             body{{ padding: 20px; }}
             .chart-container {{ margin-bottom: 30px; }}
-            
-            /* Table formatting */
             td {{ vertical-align: middle !important; font-size: 0.85rem; }}
-            
-            /* Ensure the multiline input sequence displays correctly */
             td small {{ display: block; line-height: 1.2; }}
-            
-            /* Style for the Input Sequence Column explicitly if needed */
             table tr td:nth-child(2) {{ font-family: monospace; font-size: 0.75rem; white-space: nowrap; }}
         </style>
     </head>
@@ -373,10 +407,18 @@ def home():
         
         <div class="row">
             <div class="col-md-12 chart-container">
-                 
                 <img src="data:image/png;base64,{report_data.get('plot', '')}" style="width:100%">
             </div>
         </div>
+        
+        <div class="row">
+            <div class="col-md-12">
+                <h3>Data Inspection (Last 10 Candles)</h3>
+                <p>Verify these exact raw candles against your Binance chart (UTC time).</p>
+                {report_data.get('recent_data', '')}
+            </div>
+        </div>
+        <hr>
 
         <div class="row">
             <div class="col-md-4">
