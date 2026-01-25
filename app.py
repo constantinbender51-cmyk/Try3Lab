@@ -291,14 +291,13 @@ def generate_charts(df, pnl_dates, pnl_history):
     plt.close()
     return base64.b64encode(img.getvalue()).decode()
 
-def format_recent_data(df):
+def generate_table_html(df_slice):
     """
-    Shows last 100 rows in HTML table.
+    Helper to generate a consistent HTML table for a given dataframe slice.
+    Displays Raw, Normalized, and Derivative data columns side-by-side.
     """
-    recent = df.tail(100).copy()
-    html = '<div style="height: 600px; overflow-y: scroll;">' 
-    html += '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
-    html += '<thead class="thead-light" style="position: sticky; top: 0; z-index: 1;">'
+    html = '<table class="table table-bordered table-sm" style="font-size: 0.8rem; text-align: center;">'
+    html += '<thead class="thead-light">'
     html += '<tr>'
     html += '<th rowspan="2" style="vertical-align: middle;">Timestamp (UTC)</th>'
     html += '<th colspan="4">Raw Binance Data (USD)</th>'
@@ -313,7 +312,7 @@ def format_recent_data(df):
     html += '</thead>'
     html += '<tbody>'
     
-    for index, row in recent.iterrows():
+    for index, row in df_slice.iterrows():
         ts_str = index.strftime('%Y-%m-%d %H:%M')
         # Raw (2 decimals)
         r_vals = f"<td>{row['open']:.2f}</td><td>{row['high']:.2f}</td><td>{row['low']:.2f}</td><td>{row['close']:.2f}</td>"
@@ -324,7 +323,7 @@ def format_recent_data(df):
         
         html += f"<tr><td>{ts_str}</td>{r_vals}{n_vals}{d_vals}</tr>"
         
-    html += '</tbody></table></div>'
+    html += '</tbody></table>'
     return html
 
 report_data = {}
@@ -336,29 +335,16 @@ def main_logic():
         print("Error: No data fetched.")
         return
 
-    # 2. PRINT First and Last 10 Entries for verification
-    # We display index (timestamp), raw close, norm close, and deriv close
-    print("\n" + "="*80)
-    print(f" UNIFIED DATAFRAME CHECK (Index=Timestamp) for {SYMBOL}")
-    print("="*80)
+    # 2. GENERATE HTML TABLES FOR VERIFICATION
+    # Capture the exact first 10 and last 10 rows from the Unified DataFrame
+    report_data['first_10'] = generate_table_html(df.head(10))
+    report_data['last_10'] = generate_table_html(df.tail(10))
     
-    # Selecting specific columns to keep print output clean but informative
-    # Note: 'timestamp' is the Index, so it prints automatically on the left.
-    cols_check = ['open', 'close', 'n_close', 'd_close']
-    
-    print("\n--- FIRST 10 ENTRIES ---")
-    print(df[cols_check].head(10))
-    
-    print("\n--- LAST 10 ENTRIES ---")
-    print(df[cols_check].tail(10))
-    print("="*80 + "\n")
-
     # 3. Use this SINGLE aligned dataframe for Prediction
     deriv_rules, norm_rules, test_df, top_seq = build_sequences_and_predict(df)
     results_df, stats, dates, pnl_curve = run_backtest(deriv_rules, norm_rules, test_df)
     
     plot_url = generate_charts(df, dates, pnl_curve)
-    report_data['recent_data'] = format_recent_data(df)
     
     formatted_seq = []
     for item in top_seq:
@@ -410,9 +396,14 @@ def home():
         
         <div class="row">
             <div class="col-md-12">
-                <h3>Data Inspection (Last 100 Candles)</h3>
-                <p>Verify these exact raw candles against your Binance chart (UTC time).</p>
-                {report_data.get('recent_data', '')}
+                <h3>Data Alignment Verification</h3>
+                <p>The tables below show the <strong>exact same index</strong> used for Raw, Normalized, and Derivative data.</p>
+                
+                <h4>First 10 Entries (Start of Dataset)</h4>
+                {report_data.get('first_10', '')}
+                
+                <h4>Last 10 Entries (End of Dataset)</h4>
+                {report_data.get('last_10', '')}
             </div>
         </div>
         <hr>
