@@ -12,7 +12,7 @@ import socketserver
 import threading
 import time
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # --- Configuration ---
 TIMEFRAME = os.environ.get('TIMEFRAME', '1h')
@@ -40,7 +40,7 @@ recent_data = {}
 # --- Functions ---
 
 def fetch(timeframe, symbol, start_str, end_str):
-    """Fetches OHLCV data from Binance."""
+    """Fetches OHLCV data from Binance with basic retry logic."""
     print(f"Fetching {symbol} {timeframe} from {start_str} to {end_str}...")
     exchange = ccxt.binance()
     start_ts = exchange.parse8601(start_str)
@@ -65,7 +65,11 @@ def fetch(timeframe, symbol, start_str, end_str):
             time.sleep(0.1) 
         except Exception as e:
             print(f"Error fetching: {e}")
-            break
+            if "Too Many Requests" in str(e) or "429" in str(e):
+                print("Rate limit hit. Sleeping 60s...")
+                time.sleep(60)
+            else:
+                break
             
     df = pd.DataFrame(ohlc, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -122,6 +126,12 @@ def gettop(df_split1, c, d):
 def completesimilarbeginnings(df_target, model_patterns, e, d):
     """Predicts on df_target using the top patterns."""
     print("Running predictions...")
+    
+    # --- FIX: Guard Clause for Empty/Short Data ---
+    if len(df_target) < d:
+        print(f"Warning: Not enough data for predictions. Need {d}, got {len(df_target)}.")
+        return pd.DataFrame()
+        
     data_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
     ohlc_cols = ['open', 'high', 'low', 'close']
     
@@ -275,7 +285,7 @@ def predict_on_recent(model_patterns, df_recent, e, d):
 # --- Live Loop ---
 
 def get_seconds_to_sleep(timeframe):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None) # naive UTC for calc
     unit = timeframe[-1]
     val = int(timeframe[:-1])
     
@@ -504,8 +514,11 @@ def main():
     
     preds = completesimilarbeginnings(split2, model_sequences, E, D)
     
-    recent_start = (datetime.utcnow() - timedelta(days=14)).isoformat()
-    recent_end = datetime.utcnow().isoformat()
+    # Use timezone-aware current time for recent data fetch to avoid deprecation warnings
+    now_utc = datetime.now(timezone.utc)
+    recent_start = (now_utc - timedelta(days=14)).isoformat()
+    recent_end = now_utc.isoformat()
+    
     df_recent = fetch(TIMEFRAME, SYMBOL, recent_start, recent_end)
     df_recent_derived = deriveround(df_recent)
     preds_recent = predict_on_recent(model_sequences, df_recent_derived, E, D)
