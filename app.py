@@ -11,11 +11,13 @@ from flask import Flask, render_template_string
 
 # Configuration
 DATA_DIR = '/app/data'
-DATA_FILE = os.path.join(DATA_DIR, 'ohlc.csv')
+DATA_FILE = os.path.join(DATA_DIR, 'ohlc_2025.csv')
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '1h'
+START_DATE = '2025-01-01 00:00:00'
+END_DATE = '2026-01-01 00:00:00'
 SEQ_LEN = 3
-ROUNDING_STEP = 0.002  # 0.2%
+ROUNDING_STEP = 0.001  # 0.2%
 THRESHOLD = 0.005 # 0.5%
 PORT = 8080
 
@@ -28,18 +30,58 @@ def ensure_dir(directory):
 def fetch_data():
     ensure_dir(DATA_DIR)
     
+    # Check if data exists and covers the requested range roughly (by checking file existence)
+    # For strict compliance, we overwrite if the file name matches or just reload.
     if os.path.exists(DATA_FILE):
         print("Loading data from disk...")
         df = pd.read_csv(DATA_FILE, index_col=0, parse_dates=True)
     else:
-        print("Fetching data from Binance...")
+        print(f"Fetching data from Binance ({START_DATE} to {END_DATE})...")
         exchange = ccxt.binance()
-        # Fetching approx 1000 candles (default)
-        ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        # Convert dates to milliseconds timestamp
+        since = int(pd.Timestamp(START_DATE).timestamp() * 1000)
+        end_ts = int(pd.Timestamp(END_DATE).timestamp() * 1000)
+        
+        all_candles = []
+        
+        while since < end_ts:
+            try:
+                # Fetch candles
+                ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1000)
+                
+                if not ohlcv:
+                    break
+                
+                # Append to list
+                all_candles.extend(ohlcv)
+                
+                # Update 'since' to the timestamp of the last candle + 1 timeframe (3600000ms for 1h)
+                # Or simply use the last timestamp + 1ms to avoid duplicates if exchange supports it
+                last_timestamp = ohlcv[-1][0]
+                since = last_timestamp + 1 
+                
+                # Safety break if we passed the end date significantly (optimization)
+                if last_timestamp >= end_ts:
+                    break
+                    
+                print(f"Fetched up to {pd.to_datetime(last_timestamp, unit='ms')}")
+                
+            except Exception as e:
+                print(f"Error fetching data: {e}")
+                break
+
+        df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
+        
+        # Filter strictly within the start and end dates
+        mask = (df.index >= pd.Timestamp(START_DATE)) & (df.index < pd.Timestamp(END_DATE))
+        df = df.loc[mask]
+        
         df.to_csv(DATA_FILE)
+        print(f"Saved {len(df)} rows to {DATA_FILE}")
+        
     return df
 
 def prepare_data(df):
@@ -52,19 +94,24 @@ def prepare_data(df):
 
     # 5. Divide raw ohlc by first candle (e.g. open / first open)
     # We normalize each column by the very first value of that column in the dataset
-    first_vals = df.iloc[0]
-    norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
-    for col, n_col in zip(['open', 'high', 'low', 'close'], norm_cols):
-        df[n_col] = df[col] / first_vals[col]
+    # Note: With a specific date range, "first value" is the Open of Jan 1 2025 00:00
+    if len(df) > 0:
+        first_vals = df.iloc[0]
+        norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
+        for col, n_col in zip(['open', 'high', 'low', 'close'], norm_cols):
+            df[n_col] = df[col] / first_vals[col]
 
-    # 6. Round raw ohlc and derivative version to 0.2% (0.002)
-    # Logic: (Value / Step).round() * Step
-    cols_to_round = deriv_cols + norm_cols
-    df[cols_to_round] = (df[cols_to_round] / ROUNDING_STEP).round() * ROUNDING_STEP
+        # 6. Round raw ohlc (normalized) and derivative version to 0.2% (0.002)
+        # Logic: (Value / Step).round() * Step
+        cols_to_round = deriv_cols + norm_cols
+        df[cols_to_round] = (df[cols_to_round] / ROUNDING_STEP).round() * ROUNDING_STEP
 
     return df
 
 def build_sequences_and_predict(df):
+    if len(df) < SEQ_LEN:
+        return {}, df
+
     # Split Train/Test (80/20)
     split_idx = int(len(df) * 0.8)
     train_df = df.iloc[:split_idx].copy()
@@ -74,25 +121,19 @@ def build_sequences_and_predict(df):
     pattern_map = {}
 
     # We extract the derivative columns as a numpy array for speed/slicing
-    # Columns: d_open, d_high, d_low, d_close
     d_data = train_df[['d_open', 'd_high', 'd_low', 'd_close']].values
     
     # Calculate returns for labeling (Close to Close change of the NEXT candle)
-    # Using raw close prices for accuracy
     train_outcomes = (train_df['close'].shift(-1) - train_df['close']) / train_df['close']
     
     print("Training model on OHLC sequences...")
     # Iterate through training data
-    # i represents the index of the 'current' candle (end of sequence)
     for i in range(SEQ_LEN - 1, len(train_df) - 1):
-        # Sequence: last 3 candles of OHLC derivatives
-        # Slice is exclusive on upper bound, so i+1 includes row i
         seq_array = d_data[i-SEQ_LEN+1 : i+1] 
-        seq = tuple(seq_array.flatten()) # Flatten 3x4 array to 1D tuple for hashing
+        seq = tuple(seq_array.flatten()) 
         
         outcome_val = train_outcomes.iloc[i]
         
-        # Determine Label
         if outcome_val > THRESHOLD:
             label = 'UP'
         elif outcome_val < -THRESHOLD:
@@ -115,8 +156,9 @@ def build_sequences_and_predict(df):
 
 def run_backtest(prediction_rules, test_df):
     results = []
-    
-    # Prepare test data arrays
+    if len(test_df) < SEQ_LEN:
+        return pd.DataFrame(), {}, [], []
+
     d_data = test_df[['d_open', 'd_high', 'd_low', 'd_close']].values
     opens = test_df['open'].values
     closes = test_df['close'].values
@@ -125,17 +167,15 @@ def run_backtest(prediction_rules, test_df):
     wins = 0
     total_trades = 0
     
-    # PnL History for plotting
     pnl_history = [0]
     dates = [test_df.index[0]]
 
     print("Running backtest...")
-    # Iterate test data
     for i in range(SEQ_LEN - 1, len(test_df) - 1):
         seq_array = d_data[i-SEQ_LEN+1 : i+1]
         seq = tuple(seq_array.flatten())
         
-        pred = prediction_rules.get(seq, 'FLAT') # Default to FLAT if unseen
+        pred = prediction_rules.get(seq, 'FLAT')
         
         # Trade execution on NEXT candle
         entry_price = opens[i+1]
@@ -143,13 +183,11 @@ def run_backtest(prediction_rules, test_df):
         
         trade_pnl = 0.0
         
-        # Calculate PnL based on prediction
         if pred == 'UP':
             trade_pnl = (exit_price - entry_price) / entry_price
         elif pred == 'DOWN':
             trade_pnl = -(exit_price - entry_price) / entry_price
         
-        # Check accuracy (Directional)
         actual_move_pct = (exit_price - entry_price) / entry_price
         
         if pred != 'FLAT':
@@ -179,8 +217,12 @@ def run_backtest(prediction_rules, test_df):
 
 def generate_plot(dates, pnl_history):
     plt.figure(figsize=(10, 5))
-    plt.plot(dates, pnl_history, label='Strategy PnL (Cumulative %)')
-    plt.title(f'Backtest Results: ETH/USDT ({TIMEFRAME})')
+    if len(dates) > 1:
+        plt.plot(dates, pnl_history, label='Strategy PnL (Cumulative %)')
+    else:
+        plt.text(0.5, 0.5, 'Not enough trades to plot', ha='center')
+        
+    plt.title(f'Backtest Results: {SYMBOL} ({TIMEFRAME}) {START_DATE} to {END_DATE}')
     plt.ylabel('PnL (Decimal)')
     plt.xlabel('Date')
     plt.legend()
@@ -191,18 +233,20 @@ def generate_plot(dates, pnl_history):
     img.seek(0)
     return base64.b64encode(img.getvalue()).decode()
 
-# Global storage for server
 report_data = {}
 
 def main_logic():
     df = fetch_data()
+    if df.empty:
+        print("No data found for the specified range.")
+        return
+
     df = prepare_data(df)
     rules, test_df = build_sequences_and_predict(df)
     results_df, stats, dates, pnl_curve = run_backtest(rules, test_df)
     
     plot_url = generate_plot(dates, pnl_curve)
     
-    # Store for Flask
     report_data['stats'] = stats
     report_data['plot'] = plot_url
     if not results_df.empty:
@@ -223,24 +267,24 @@ def home():
         <style>body{{ padding: 20px; }}</style>
     </head>
     <body>
-        <h1>ETH/USDT 1H OHLC Prediction</h1>
+        <h1>{SYMBOL} Prediction ({START_DATE} - {END_DATE})</h1>
         <hr>
         <div class="row">
             <div class="col-md-4">
                 <h3>Performance Stats</h3>
                 <ul class="list-group">
-                    <li class="list-group-item">Total Trades: {report_data['stats']['total_trades']}</li>
-                    <li class="list-group-item">Win Rate: {report_data['stats']['win_rate']}%</li>
-                    <li class="list-group-item">Final PnL: {report_data['stats']['final_pnl_pct']}%</li>
+                    <li class="list-group-item">Total Trades: {report_data.get('stats', {}).get('total_trades', 0)}</li>
+                    <li class="list-group-item">Win Rate: {report_data.get('stats', {}).get('win_rate', 0)}%</li>
+                    <li class="list-group-item">Final PnL: {report_data.get('stats', {}).get('final_pnl_pct', 0)}%</li>
                 </ul>
             </div>
             <div class="col-md-8">
-                <img src="data:image/png;base64,{report_data['plot']}" style="width:100%">
+                <img src="data:image/png;base64,{report_data.get('plot', '')}" style="width:100%">
             </div>
         </div>
         <hr>
         <h3>Recent Test Trades (Last 20)</h3>
-        {report_data['table']}
+        {report_data.get('table', '')}
     </body>
     </html>
     """
