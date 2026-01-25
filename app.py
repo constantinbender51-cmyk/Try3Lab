@@ -19,7 +19,7 @@ END_STR = None
 B_SPLIT = 0.70
 C_TOP = 0.20 # Unused now
 D_LEN = 4 
-E_SIM = 0.5 # Adjusted for Sum of Absolute Differences (SAD). 0.5 is a reasonable cumulative error threshold for pct changes.
+E_SIM = 0.1 # Adjusted for Sum of Absolute Differences (SAD). 0.5 is a reasonable cumulative error threshold for pct changes.
 API_PORT = 8080
 
 # Global state
