@@ -8,22 +8,24 @@ import io
 import base64
 import time
 import sys
+import math
 from datetime import datetime
 from collections import Counter, defaultdict
+import json
 
 # ---------------------------------------------------------
 # 7. All parameters defined at the top
 # ---------------------------------------------------------
-SYMBOL = 'BTCUSDT'
+SYMBOL = 'SHIBUSDT'   # Changed to SHIB to demonstrate robustness
 INTERVAL = '1h'
-START_TIME = '2020-01-01'
+START_TIME = '2024-01-01' # Adjusted for SHIB data availability/relevance
 END_TIME = '2026-01-01'
 PORT = 8080
 GRID_PERCENT = 0.01  # 1%
 TRAIN_SPLIT_RATIO = 0.7
 
 # ---------------------------------------------------------
-# 1. Fetch 1h ohlc from binance (Pagination logic included)
+# 1. Fetch 1h ohlc from binance
 # ---------------------------------------------------------
 def fetch_binance_data(symbol, interval, start_str, end_str):
     print(f"Fetching {symbol} {interval} data from {start_str} to {end_str}...")
@@ -52,14 +54,10 @@ def fetch_binance_data(symbol, interval, start_str, end_str):
                 
             all_data.extend(data)
             
-            # Update start_ts to the last close time + 1ms
             last_close_time = data[-1][6]
             start_ts = last_close_time + 1
             
-            # Simple rate limit handling
-            time.sleep(0.1)
-            
-            # Progress indicator
+            time.sleep(0.05) 
             sys.stdout.write(f"\rFetched {len(all_data)} candles...")
             sys.stdout.flush()
             
@@ -69,18 +67,15 @@ def fetch_binance_data(symbol, interval, start_str, end_str):
             
     print("\nData fetch complete.")
     
-    # Create DataFrame
     df = pd.DataFrame(all_data, columns=[
         'open_time', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_asset_volume', 'trades', 
         'taker_buy_base', 'taker_buy_quote', 'ignore'
     ])
     
-    # Convert types
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
     df['close'] = df['close'].astype(float)
     
-    # Keep only necessary columns
     return df[['open_time', 'close']]
 
 # ---------------------------------------------------------
@@ -91,19 +86,27 @@ def run_backtest(df):
     first_close = df['close'].iloc[0]
     grid_size = first_close * GRID_PERCENT
     
-    print(f"First Close: {first_close}, Grid Size (1%): {grid_size}")
+    # --- DYNAMIC PRECISION LOGIC ---
+    # Log10 gives us the magnitude (e.g., 0.01 -> -2, 0.0001 -> -4)
+    # We take the ceiling of the negative log to get decimal places needed.
+    # We add 2 extra digits of safety to prevent float artifacts.
+    if grid_size == 0:
+        needed_precision = 8
+    else:
+        needed_precision = int(math.ceil(-math.log10(grid_size))) + 2
     
+    # Cap precision to avoid excessive length (Binance max is usually 8)
+    needed_precision = max(2, min(needed_precision, 10))
+    
+    print(f"First Close: {first_close}")
+    print(f"Grid Size (1%): {grid_size:.{needed_precision}f}")
+    print(f"Dynamic Precision set to: {needed_precision} decimals")
+
     # Rounding logic: round(value / step) * step
-    df['rounded_close'] = (df['close'] / grid_size).round() * grid_size
+    # We round the FINAL result to 'needed_precision' to clean artifacts
+    df['rounded_close'] = ((df['close'] / grid_size).round() * grid_size).round(needed_precision)
     
-    # Prepare Sequences
-    # We need sequences of 3 rounded closes -> Next Direction
-    # Direction logic: 
-    # If next_rounded > curr_rounded -> UP
-    # If next_rounded < curr_rounded -> DOWN
-    # Else -> FLAT
-    
-    # Shift to get next value
+    # Prepare Targets
     df['next_rounded'] = df['rounded_close'].shift(-1)
     df['next_close_raw'] = df['close'].shift(-1)
     
@@ -114,14 +117,15 @@ def run_backtest(df):
     choices = ['UP', 'DOWN']
     df['target_direction'] = np.select(conditions, choices, default='FLAT')
     
-    # Create sequences of length 3
-    # We need input: [t-2, t-1, t] to predict t+1
-    # Create lag columns for the sequence
+    # Create sequences
     df['t_0'] = df['rounded_close']
     df['t_1'] = df['rounded_close'].shift(1)
     df['t_2'] = df['rounded_close'].shift(2)
+
+    df['raw_t_0'] = df['close']
+    df['raw_t_1'] = df['close'].shift(1)
+    df['raw_t_2'] = df['close'].shift(2)
     
-    # Drop NaNs created by shifting
     data = df.dropna().copy()
     
     # 3. Split train/test
@@ -131,51 +135,36 @@ def run_backtest(df):
     
     print(f"Training samples: {len(train_df)}, Test samples: {len(test_df)}")
     
-    # 4. For each unique sequence of 3 find the most frequent next close direction
-    # Map: (val1, val2, val3) -> Direction
+    # 4. Train
     sequence_map = defaultdict(list)
-    
     for _, row in train_df.iterrows():
         seq = (row['t_2'], row['t_1'], row['t_0'])
         sequence_map[seq].append(row['target_direction'])
         
-    # Consolidate to most frequent
     model = {}
     for seq, directions in sequence_map.items():
         counts = Counter(directions)
         most_common = counts.most_common(1)[0][0]
         model[seq] = most_common
         
-    # 5. Test on test sequences to obtain accuracy and pnl
+    # 5. Test
     results = []
     correct_predictions = 0
     total_predictions = 0
     cumulative_pnl = 0.0
     
-    # Iterate through test set
     test_results_list = []
     
     for idx, row in test_df.iterrows():
         seq = (row['t_2'], row['t_1'], row['t_0'])
         
-        # Prediction
-        prediction = model.get(seq, 'FLAT') # Default to FLAT if unseen
-        
+        prediction = model.get(seq, 'FLAT') 
         actual = row['target_direction']
-        is_correct = (prediction == actual)
         
-        if is_correct:
+        if prediction == actual:
             correct_predictions += 1
         total_predictions += 1
         
-        # PnL Calculation
-        # Strategy: 
-        # UP prediction -> Long (Profit = Next Close - Curr Close)
-        # DOWN prediction -> Short (Profit = Curr Close - Next Close)
-        # FLAT -> No trade
-        
-        # Note: Using raw close prices for PnL to reflect real money, 
-        # though logic is based on rounded grid.
         curr_price = row['close']
         next_price = row['next_close_raw']
         
@@ -187,55 +176,46 @@ def run_backtest(df):
             
         cumulative_pnl += trade_pnl
         
-        # Save for table (Paginated display)
-        # 9. Show input prices with timestamp and target price w/ timestamp
-        # We need to recover timestamps for t-2 and t-1
-        # Since we are iterating rows, row['open_time'] is time T.
-        # T-1 is T - 1h, T-2 is T - 2h
-        
         test_results_list.append({
             'time_t': row['open_time'],
-            'price_t': row['close'],
-            'price_t_rounded': row['t_0'],
-            'price_t_1': row['t_1'],
-            'price_t_2': row['t_2'],
+            'rnd_t_2': row['t_2'],
+            'rnd_t_1': row['t_1'],
+            'rnd_t_0': row['t_0'],
+            'raw_t_2': row['raw_t_2'],
+            'raw_t_1': row['raw_t_1'],
+            'raw_t_0': row['raw_t_0'],
             'prediction': prediction,
             'actual': actual,
             'pnl': trade_pnl,
             'cum_pnl': cumulative_pnl,
-            'next_price': next_price
+            'next_price_raw': next_price
         })
         
     accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
     
     print(f"Accuracy: {accuracy:.2f}%")
-    print(f"Total PnL: {cumulative_pnl:.2f}")
+    print(f"Total PnL: {cumulative_pnl:.8f}")
     
-    return train_df, test_df, test_results_list, accuracy, cumulative_pnl
+    return train_df, test_df, test_results_list, accuracy, cumulative_pnl, grid_size, needed_precision
 
 # ---------------------------------------------------------
-# 6. Serve plot and table on port 8080 (Matplotlib + http.server)
+# 6. Serve plot and table
 # ---------------------------------------------------------
-def create_plot(df, test_results):
+def create_plot(df, test_results, accuracy, total_pnl):
     plt.figure(figsize=(12, 6))
+    plt.plot(df['open_time'], df['close'], label='Price', color='gray', alpha=0.3)
     
-    # Plot entire price history
-    plt.plot(df['open_time'], df['close'], label='Price', color='gray', alpha=0.5)
-    
-    # Plot Equity Curve for the test period
     test_times = [x['time_t'] for x in test_results]
     test_pnl = [x['cum_pnl'] for x in test_results]
     
-    # Create a secondary axis for PnL
     ax1 = plt.gca()
     ax2 = ax1.twinx()
-    ax2.plot(test_times, test_pnl, label='Strategy PnL', color='blue')
+    ax2.plot(test_times, test_pnl, label='Strategy PnL', color='blue', linewidth=1.5)
     
     ax1.set_ylabel('Price (USDT)')
     ax2.set_ylabel('Cumulative PnL (USDT)')
-    plt.title(f'Backtest Results: {SYMBOL} | Acc: {accuracy:.2f}% | PnL: {total_pnl:.2f}')
+    plt.title(f'Backtest: {SYMBOL} | Acc: {accuracy:.2f}% | PnL: {total_pnl:.6f}')
     
-    # Save to base64
     buf = io.BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
@@ -243,71 +223,69 @@ def create_plot(df, test_results):
     plt.close()
     return image_base64
 
-# HTML Template with Client-Side Pagination script
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <title>Binance Backtest Results</title>
     <style>
-        body {{ font-family: sans-serif; margin: 20px; }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
-        img {{ max-width: 100%; height: auto; border: 1px solid #ddd; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 0.9em; }}
-        th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
-        th {{ background-color: #f2f2f2; }}
+        body {{ font-family: monospace; margin: 20px; color: #333; }}
+        .container {{ max-width: 95%; margin: 0 auto; }}
+        img {{ max-width: 100%; height: auto; border: 1px solid #ccc; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
+        th, td {{ padding: 6px 10px; text-align: left; border-bottom: 1px solid #ddd; }}
+        th {{ background-color: #eee; }}
         .pagination {{ margin-top: 20px; text-align: center; }}
-        button {{ padding: 5px 10px; margin: 0 5px; cursor: pointer; }}
+        button {{ padding: 5px 15px; margin: 0 5px; cursor: pointer; }}
         .up {{ color: green; font-weight: bold; }}
         .down {{ color: red; font-weight: bold; }}
-        .stats {{ background: #f9f9f9; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
+        .stats {{ background: #f4f4f4; padding: 15px; border-radius: 4px; margin-bottom: 20px; }}
+        .raw-price {{ color: #666; font-style: italic; }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Backtest Report: {symbol}</h1>
+        <h2>Backtest Report: {symbol}</h2>
         
         <div class="stats">
             <strong>Interval:</strong> {interval} | 
             <strong>Start:</strong> {start} | 
-            <strong>End:</strong> {end} <br>
+            <strong>End:</strong> {end} |
+            <strong>Grid Size:</strong> {grid_size} <br>
             <strong>Accuracy:</strong> {accuracy:.2f}% | 
-            <strong>Total PnL:</strong> {pnl:.2f} USDT
+            <strong>Total PnL:</strong> {pnl} USDT
         </div>
 
-        <h3>Equity Curve & Price</h3>
         <img src="data:image/png;base64,{plot_data}" />
 
         <h3>Prediction Log</h3>
-        <div id="table-container">
-            <table id="resultsTable">
-                <thead>
-                    <tr>
-                        <th>Time (T)</th>
-                        <th>Input Seq (Rounded) [T-2, T-1, T]</th>
-                        <th>Actual Price (T)</th>
-                        <th>Prediction</th>
-                        <th>Target Price (T+1)</th>
-                        <th>Actual Dir</th>
-                        <th>PnL</th>
-                    </tr>
-                </thead>
-                <tbody id="tableBody"></tbody>
-            </table>
-        </div>
-        
         <div class="pagination">
             <button onclick="prevPage()">Previous</button>
-            <span id="pageInfo"></span>
+            <span id="pageInfoTop"></span>
             <button onclick="nextPage()">Next</button>
         </div>
+        
+        <table id="resultsTable">
+            <thead>
+                <tr>
+                    <th>Time (T)</th>
+                    <th>Raw Input [T-2, T-1, T]</th>
+                    <th>Grid Input [T-2, T-1, T]</th>
+                    <th>Prediction</th>
+                    <th>Target Raw (T+1)</th>
+                    <th>Actual Dir</th>
+                    <th>PnL</th>
+                </tr>
+            </thead>
+            <tbody id="tableBody"></tbody>
+        </table>
     </div>
 
     <script>
-        // Data injected from Python
         const data = {json_data};
-        const rowsPerPage = 20;
+        const rowsPerPage = 50;
         let currentPage = 1;
+        const precision = {precision}; // Passed from Python
 
         function renderTable() {{
             const tbody = document.getElementById('tableBody');
@@ -320,23 +298,27 @@ HTML_TEMPLATE = """
             pageData.forEach(row => {{
                 const tr = document.createElement('tr');
                 
-                // Format prediction color
                 const predClass = row.prediction === 'UP' ? 'up' : (row.prediction === 'DOWN' ? 'down' : '');
                 const actualClass = row.actual === 'UP' ? 'up' : (row.actual === 'DOWN' ? 'down' : '');
+                const pnlColor = row.pnl >= 0 ? 'green' : 'red';
+                
+                // Use the calculated precision for display
+                const rawP = precision + 1; // Show slightly more for raw
                 
                 tr.innerHTML = `
                     <td>${{row.time_t}}</td>
-                    <td>[${{row.price_t_2}}, ${{row.price_t_1}}, ${{row.price_t_rounded}}]</td>
-                    <td>${{row.price_t.toFixed(2)}}</td>
+                    <td class="raw-price">[${{row.raw_t_2.toFixed(rawP)}}, ${{row.raw_t_1.toFixed(rawP)}}, ${{row.raw_t_0.toFixed(rawP)}}]</td>
+                    <td>[${{row.rnd_t_2.toFixed(precision)}}, ${{row.rnd_t_1.toFixed(precision)}}, ${{row.rnd_t_0.toFixed(precision)}}]</td>
                     <td class="${{predClass}}">${{row.prediction}}</td>
-                    <td>${{row.next_price.toFixed(2)}}</td>
+                    <td>${{row.next_price_raw.toFixed(rawP)}}</td>
                     <td class="${{actualClass}}">${{row.actual}}</td>
-                    <td style="color: ${{row.pnl >= 0 ? 'green' : 'red'}}">${{row.pnl.toFixed(2)}}</td>
+                    <td style="color: ${{pnlColor}}">${{row.pnl.toFixed(precision)}}</td>
                 `;
                 tbody.appendChild(tr);
             }});
 
-            document.getElementById('pageInfo').innerText = `Page ${{currentPage}} of ${{Math.ceil(data.length / rowsPerPage)}}`;
+            const info = `Page ${{currentPage}} of ${{Math.ceil(data.length / rowsPerPage)}}`;
+            document.getElementById('pageInfoTop').innerText = info;
         }}
 
         function prevPage() {{
@@ -353,7 +335,6 @@ HTML_TEMPLATE = """
             }}
         }}
 
-        // Initial Render
         renderTable();
     </script>
 </body>
@@ -366,35 +347,39 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/html")
         self.end_headers()
         
-        # Prepare data for JS (Converting timestamps to string for JSON serialization)
-        # We limit the data passed to JS to avoid browser memory issues if millions of rows,
-        # but for 5 years of 1h data (~50k rows), it's fine.
         js_data = []
         for r in test_results:
             js_data.append({
                 'time_t': str(r['time_t']),
-                'price_t_2': r['price_t_2'],
-                'price_t_1': r['price_t_1'],
-                'price_t_rounded': r['price_t_rounded'],
-                'price_t': r['price_t'],
+                'raw_t_2': r['raw_t_2'],
+                'raw_t_1': r['raw_t_1'],
+                'raw_t_0': r['raw_t_0'],
+                'rnd_t_2': r['rnd_t_2'],
+                'rnd_t_1': r['rnd_t_1'],
+                'rnd_t_0': r['rnd_t_0'],
                 'prediction': r['prediction'],
-                'next_price': r['next_price'],
+                'next_price_raw': r['next_price_raw'],
                 'actual': r['actual'],
                 'pnl': r['pnl']
             })
             
-        import json
         json_str = json.dumps(js_data)
+        
+        # Format grid size string based on precision
+        grid_fmt = f"{grid_size:.{needed_precision}f}"
+        pnl_fmt = f"{total_pnl:.{needed_precision}f}"
         
         html_content = HTML_TEMPLATE.format(
             symbol=SYMBOL,
             interval=INTERVAL,
             start=START_TIME,
             end=END_TIME,
+            grid_size=grid_fmt,
             accuracy=accuracy,
-            pnl=total_pnl,
+            pnl=pnl_fmt,
             plot_data=plot_b64,
-            json_data=json_str
+            json_data=json_str,
+            precision=needed_precision
         )
         
         self.wfile.write(html_content.encode('utf-8'))
@@ -403,21 +388,17 @@ class BacktestHandler(http.server.BaseHTTPRequestHandler):
 # Execution
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    # 1. Fetch
     df = fetch_binance_data(SYMBOL, INTERVAL, START_TIME, END_TIME)
     
     if df.empty:
         print("No data fetched. Exiting.")
         sys.exit(1)
         
-    # 2-5. Process, Train, Test
-    train_df, test_df, test_results, accuracy, total_pnl = run_backtest(df)
+    train_df, test_df, test_results, accuracy, total_pnl, grid_size, needed_precision = run_backtest(df)
     
-    # 6. Generate Plot
     print("Generating plot...")
-    plot_b64 = create_plot(df, test_results)
+    plot_b64 = create_plot(df, test_results, accuracy, total_pnl)
     
-    # 7. Serve
     print(f"Starting server on port {PORT}...")
     print(f"Open your browser at http://localhost:{PORT}")
     
