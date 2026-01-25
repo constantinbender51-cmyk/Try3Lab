@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 # --- Parameters ---
 SYMBOL = 'BTC/USDT'
 TIMEFRAME = '1h'
-START_STR = '2025-01-01 00:00:00' 
+START_STR = '2023-01-01 00:00:00' 
 END_STR = None 
 B_SPLIT = 0.70
 C_TOP = 0.20
