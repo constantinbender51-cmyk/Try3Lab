@@ -89,24 +89,18 @@ def prepare_data(df):
 
     return df
 
-def build_sequences_and_predict(df):
-    if len(df) < SEQ_LEN:
-        return {}, df, []
-
-    # Split Train/Test
-    split_idx = int(len(df) * 0.8)
-    train_df = df.iloc[:split_idx].copy()
-    test_df = df.iloc[split_idx:].copy()
-
-    # 7. Count outcome of every sequence
+def train_model(train_df, input_cols):
+    """
+    Helper function to train a prediction map for a specific set of input columns.
+    """
     pattern_map = {}
-
-    d_data = train_df[['d_open', 'd_high', 'd_low', 'd_close']].values
+    
+    # Extract data for the specific columns
+    data_values = train_df[input_cols].values
     train_outcomes = (train_df['close'].shift(-1) - train_df['close']) / train_df['close']
     
-    print("Training model on OHLC sequences...")
     for i in range(SEQ_LEN - 1, len(train_df) - 1):
-        seq_array = d_data[i-SEQ_LEN+1 : i+1] 
+        seq_array = data_values[i-SEQ_LEN+1 : i+1] 
         seq = tuple(seq_array.flatten()) 
         
         outcome_val = train_outcomes.iloc[i]
@@ -120,18 +114,16 @@ def build_sequences_and_predict(df):
         
         pattern_map[seq][label] += 1
         pattern_map[seq]['total'] += 1
-
-    # Generate Prediction Rules and Top Sequences Stats
+        
+    # Generate Rules
     prediction_rules = {}
     sequence_stats = []
 
     for seq, counts in pattern_map.items():
-        # Determine best outcome (excluding 'total' key)
         outcomes = {k: v for k, v in counts.items() if k != 'total'}
         best_outcome = max(outcomes, key=outcomes.get)
         prediction_rules[seq] = best_outcome
         
-        # Store for top 10 table
         sequence_stats.append({
             'sequence': seq,
             'total_count': counts['total'],
@@ -140,19 +132,41 @@ def build_sequences_and_predict(df):
             'down': counts['DOWN'],
             'flat': counts['FLAT']
         })
+        
+    return prediction_rules, sequence_stats
 
-    # Sort by total frequency descending
-    sequence_stats.sort(key=lambda x: x['total_count'], reverse=True)
-    top_10_sequences = sequence_stats[:10]
+def build_sequences_and_predict(df):
+    if len(df) < SEQ_LEN:
+        return {}, {}, df, []
 
-    return prediction_rules, test_df, top_10_sequences
+    # Split Train/Test
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx].copy()
+    test_df = df.iloc[split_idx:].copy()
 
-def run_backtest(prediction_rules, test_df):
+    print("Training Derivative Model...")
+    deriv_cols = ['d_open', 'd_high', 'd_low', 'd_close']
+    deriv_rules, deriv_stats = train_model(train_df, deriv_cols)
+
+    print("Training Raw Normalized Model...")
+    norm_cols = ['n_open', 'n_high', 'n_low', 'n_close']
+    norm_rules, norm_stats = train_model(train_df, norm_cols)
+
+    # Sort stats by frequency (using derivative model for display purposes)
+    deriv_stats.sort(key=lambda x: x['total_count'], reverse=True)
+    top_10_sequences = deriv_stats[:10]
+
+    return deriv_rules, norm_rules, test_df, top_10_sequences
+
+def run_backtest(deriv_rules, norm_rules, test_df):
     results = []
     if len(test_df) < SEQ_LEN:
         return pd.DataFrame(), {}, [], []
 
+    # Prepare data arrays for both models
     d_data = test_df[['d_open', 'd_high', 'd_low', 'd_close']].values
+    n_data = test_df[['n_open', 'n_high', 'n_low', 'n_close']].values
+    
     opens = test_df['open'].values
     highs = test_df['high'].values
     lows = test_df['low'].values
@@ -165,19 +179,38 @@ def run_backtest(prediction_rules, test_df):
     pnl_history = [0]
     dates = [test_df.index[0]]
 
-    print("Running backtest...")
+    print("Running backtest with Dual Models (Raw + Derivative)...")
     for i in range(SEQ_LEN - 1, len(test_df) - 1):
-        # Sequence logic (Prediction inputs)
-        seq_array = d_data[i-SEQ_LEN+1 : i+1]
-        seq = tuple(seq_array.flatten())
+        # 1. Get Derivative Prediction
+        seq_array_d = d_data[i-SEQ_LEN+1 : i+1]
+        seq_d = tuple(seq_array_d.flatten())
+        pred_deriv = deriv_rules.get(seq_d, 'FLAT')
+
+        # 2. Get Raw Normalized Prediction
+        seq_array_n = n_data[i-SEQ_LEN+1 : i+1]
+        seq_n = tuple(seq_array_n.flatten())
+        pred_norm = norm_rules.get(seq_n, 'FLAT')
         
-        pred = prediction_rules.get(seq, 'FLAT')
+        # 3. Apply Consensus/Conflict Logic
+        final_pred = 'FLAT'
         
+        # Conflict check: UP vs DOWN or DOWN vs UP
+        if (pred_deriv == 'UP' and pred_norm == 'DOWN') or \
+           (pred_deriv == 'DOWN' and pred_norm == 'UP'):
+            final_pred = 'FLAT' # Conflict -> No Trade
+        else:
+            # If no conflict, we take the active direction if either has one
+            if pred_deriv == 'UP' or pred_norm == 'UP':
+                final_pred = 'UP'
+            elif pred_deriv == 'DOWN' or pred_norm == 'DOWN':
+                final_pred = 'DOWN'
+            else:
+                final_pred = 'FLAT'
+
         # --- Trade Execution Logic (Trade happens on candle i+1) ---
         entry_price = opens[i+1]
         exit_price = closes[i+1]
         
-        # Capture raw OHLC for verification of the TRADE candle
         trade_o = entry_price
         trade_h = highs[i+1]
         trade_l = lows[i+1]
@@ -185,12 +218,12 @@ def run_backtest(prediction_rules, test_df):
         
         trade_pnl = 0.0
         
-        if pred == 'UP':
+        if final_pred == 'UP':
             trade_pnl = (exit_price - entry_price) / entry_price
-        elif pred == 'DOWN':
+        elif final_pred == 'DOWN':
             trade_pnl = -(exit_price - entry_price) / entry_price
         
-        if pred != 'FLAT':
+        if final_pred != 'FLAT':
             cumulative_pnl += trade_pnl
             total_trades += 1
             if trade_pnl > 0: wins += 1
@@ -198,9 +231,7 @@ def run_backtest(prediction_rules, test_df):
             pnl_history.append(cumulative_pnl)
             dates.append(test_df.index[i+1])
             
-            # --- Capture Raw OHLC for the INPUT SEQUENCE (3 candles) ---
-            # Indices for input candles are: i-2, i-1, i (since SEQ_LEN=3)
-            # We iterate k from 0 to SEQ_LEN-1
+            # Format Input sequence string (Visualizing the Derivative sequence for consistency)
             input_candles_str = ""
             for k in range(SEQ_LEN):
                 idx = i - SEQ_LEN + 1 + k
@@ -210,14 +241,15 @@ def run_backtest(prediction_rules, test_df):
                 c_c = closes[idx]
                 input_candles_str += f"[{k+1}] O:{c_o:.0f} H:{c_h:.0f} L:{c_l:.0f} C:{c_c:.0f}<br>"
 
-            # Format Raw Trade Candle for table
             trade_ohlc_str = f"O:{trade_o:.0f} H:{trade_h:.0f} L:{trade_l:.0f} C:{trade_c:.0f}"
             
             results.append({
                 'timestamp': test_df.index[i+1],
                 'input_sequence_raw': input_candles_str,
                 'trade_candle_raw': trade_ohlc_str,
-                'prediction': pred,
+                'pred_deriv': pred_deriv,
+                'pred_norm': pred_norm,
+                'final_prediction': final_pred,
                 'pnl': round(trade_pnl * 100, 2),
                 'cum_pnl': round(cumulative_pnl * 100, 2)
             })
@@ -274,12 +306,14 @@ def main_logic():
     if df.empty: return
 
     df = prepare_data(df)
-    rules, test_df, top_seq = build_sequences_and_predict(df)
-    results_df, stats, dates, pnl_curve = run_backtest(rules, test_df)
+    # Get rules for both models
+    deriv_rules, norm_rules, test_df, top_seq = build_sequences_and_predict(df)
+    # Pass both rule sets to backtest
+    results_df, stats, dates, pnl_curve = run_backtest(deriv_rules, norm_rules, test_df)
     
     plot_url = generate_charts(df, dates, pnl_curve)
     
-    # Format Top 10 Sequence Table
+    # Format Top 10 Sequence Table (Derivative)
     formatted_seq = []
     for item in top_seq:
         seq_str = ', '.join([f"{x:.3f}" for x in item['sequence']])
@@ -344,7 +378,7 @@ def home():
             </div>
             
             <div class="col-md-8">
-                <h3>Top 10 Frequent Sequences</h3>
+                <h3>Top 10 Frequent Sequences (Derivative)</h3>
                 {report_data.get('top_sequences', '')}
             </div>
         </div>
