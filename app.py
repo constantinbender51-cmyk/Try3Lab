@@ -21,11 +21,11 @@ START = os.environ.get('START', '2024-01-01 00:00:00')
 END = os.environ.get('END', '2024-06-01 00:00:00')
 
 # Parameters
-A = float(os.environ.get('A', 0.0))          # Unused (rounding removed)
+A = float(os.environ.get('A', 0.0))          # Unused
 B = float(os.environ.get('B', 0.7))          # Split % (70% training, 30% testing)
-C = float(os.environ.get('C', 0.1))          # Top % most frequent (densest) sequences to keep
+C = float(os.environ.get('C', 0.1))          # Top % densest sequences to keep
 D = int(os.environ.get('D', 4))              # Sequence length (candles)
-E = float(os.environ.get('E', 0.002))        # Similarity threshold (0.1% absolute diff)
+E = float(os.environ.get('E', 0.002))        # Similarity threshold
 
 # Global State
 results_html = "<h1>Initializing...</h1>"
@@ -73,16 +73,21 @@ def fetch(timeframe, symbol, start_str, end_str):
             
     df = pd.DataFrame(ohlc, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    
+    # Explicit float conversion to prevent object/decimal issues
+    cols = ['open', 'high', 'low', 'close', 'volume']
+    df[cols] = df[cols].astype(float)
+    
     return df
 
-def deriveround(df, a=None):
-    """Applies returns calculation."""
+def deriveround(df):
+    """Applies returns calculation and PADS the first row to maintain length."""
     df = df.copy()
     cols = ['open', 'high', 'low', 'close']
     for col in cols:
-        df[f'{col}_ret'] = df[col].pct_change()
+        # Fill NaN at index 0 with 0.0 to match length of raw OHLC
+        df[f'{col}_ret'] = df[col].pct_change().fillna(0.0)
     
-    df.dropna(inplace=True)
     return df
 
 def split(df, b):
@@ -109,7 +114,6 @@ def gettop(df_split1, c, d):
         end = min(i + chunk_size, N)
         batch = flat_windows[i:end]
         
-        # Check distance against ALL windows (sampled or blocked if too large)
         compare_set = flat_windows if N < 10000 else flat_windows[::5]
         
         for j in range(len(batch)):
@@ -124,71 +128,72 @@ def gettop(df_split1, c, d):
     return windows[top_indices]
 
 def completesimilarbeginnings(df_target, model_patterns, e, d):
-    """Predicts on df_target using the top patterns."""
+    """Predicts using a unified dataframe where OHLC and Returns are aligned 1:1."""
     print("Running predictions...")
     
-    # --- FIX: Guard Clause for Empty/Short Data ---
     if len(df_target) < d:
         print(f"Warning: Not enough data for predictions. Need {d}, got {len(df_target)}.")
         return pd.DataFrame()
-        
-    data_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
-    ohlc_cols = ['open', 'high', 'low', 'close']
+
+    # Define columns
+    ret_cols = ['open_ret', 'high_ret', 'low_ret', 'close_ret']
+    ohlc_cols = ['open', 'high', 'low', 'close'] # Raw prices
     
-    target_values = df_target[data_cols].values
-    timestamps = df_target['timestamp'].values
+    # Extract values (Lengths are now identical)
+    ret_values = df_target[ret_cols].values
     ohlc_values = df_target[ohlc_cols].values
+    timestamps = df_target['timestamp'].values
     
-    # Create sliding views for ALL data types to ensure alignment
-    target_windows = np.lib.stride_tricks.sliding_window_view(target_values, window_shape=d, axis=0)
-    target_ts = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=d, axis=0)
-    target_ohlc = np.lib.stride_tricks.sliding_window_view(ohlc_values, window_shape=d, axis=0)
+    # Create windows
+    # Window 'i' contains indices [i, i+1, ... i+D-1]
+    ret_windows = np.lib.stride_tricks.sliding_window_view(ret_values, window_shape=d, axis=0)
+    ohlc_windows = np.lib.stride_tricks.sliding_window_view(ohlc_values, window_shape=d, axis=0)
+    ts_windows = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=d, axis=0)
     
     predictions = []
     
+    # Model Setup
     model_context = model_patterns[:, :d-1, :] # (K, D-1, 4)
     model_outcome = model_patterns[:, -1, :]   # (K, 4)
     model_context_flat = model_context.reshape(model_context.shape[0], -1)
     
-    for i in range(len(target_windows)):
-        current_window = target_windows[i] # Shape (D, 4)
-        current_context = current_window[:d-1, :]
-        current_context_flat = current_context.reshape(-1)
+    for i in range(len(ret_windows)):
+        # Current Window of Length D
+        # Indices in window: 0, 1, ..., D-1
+        
+        # CONTEXT: Indices 0 to D-2 (The pattern we see)
+        current_context_ret = ret_windows[i, :d-1, :]
+        current_context_flat = current_context_ret.reshape(-1)
         
         diff = np.abs(model_context_flat - current_context_flat)
         matches_idx = np.where(np.all(diff < e, axis=1))[0]
         
         if len(matches_idx) > 0:
             matched_outcomes = model_outcome[matches_idx]
-            avg_return = np.mean(matched_outcomes[:, 3]) # Column 3 is close_ret
+            avg_return = np.mean(matched_outcomes[:, 3]) # Close return
             
             predicted_dir = 1 if avg_return > 0 else -1
             if avg_return == 0: predicted_dir = 0
             
-            # Outcome
-            # The window is [0, 1 ... D-1]
-            # Prediction Target is Index D-1 (Last candle)
-            actual_ret = current_window[-1, 3] 
+            # ACTUALS
+            # Target is the LAST candle in the window (Index D-1)
+            actual_ret = ret_windows[i, -1, 3]
             actual_dir = 1 if actual_ret > 0 else -1
             if actual_ret == 0: actual_dir = 0
             
-            # Entry Time: The start of the outcome candle (Index -1)
-            ts = pd.to_datetime(target_ts[i, -1])
+            # METADATA
+            # Entry Time: Timestamp of the Target candle (Index D-1)
+            ts = pd.to_datetime(ts_windows[i, -1])
             
-            # Prices: Source directly from target_ohlc to match the context
-            # Column indices: 0:Open, 1:High, 2:Low, 3:Close
+            # Entry Price: Close of the Last Context Candle (Index D-2)
+            entry_price = ohlc_windows[i, -2, 3]
             
-            # Entry Price: Close of the LAST CONTEXT candle (Index -2)
-            # This corresponds to entering at the exact moment the context pattern completes.
-            entry_price = target_ohlc[i, -2, 3] 
+            # Exit Price: Close of the Target Candle (Index D-1)
+            exit_price = ohlc_windows[i, -1, 3]
             
-            # Exit Price: Close of the OUTCOME candle (Index -1)
-            exit_price = target_ohlc[i, -1, 3]
-            
-            # Input Sequence (timestamps and OHLC)
-            # Indices 0 to D-2 (inclusive)
-            input_timestamps = pd.to_datetime(target_ts[i, :d-1]).strftime('%Y-%m-%d %H:%M:%S').tolist()
-            input_candles = target_ohlc[i, :d-1].tolist()
+            # Input Logs: Indices 0 to D-2
+            input_timestamps = pd.to_datetime(ts_windows[i, :d-1]).strftime('%Y-%m-%d %H:%M:%S').tolist()
+            input_candles = ohlc_windows[i, :d-1].tolist()
 
             predictions.append({
                 'timestamp': ts,
@@ -205,9 +210,7 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
     return pd.DataFrame(predictions)
 
 def printaccuracy(predictions_df):
-    """
-    Generates HTML report and structured data dictionary.
-    """
+    """Generates HTML report and structured data dictionary."""
     if predictions_df.empty:
         return "<h3>No predictions made (adjust E or C)</h3>", {"error": "No predictions"}
 
@@ -222,9 +225,9 @@ def printaccuracy(predictions_df):
     active['pnl'] = active['predicted_dir'] * active['actual_ret']
     active['cum_pnl'] = active['pnl'].cumsum()
     
-    # --- Plot Generation ---
+    # Plot
     plt.figure(figsize=(10, 5))
-    plt.plot(active['timestamp'], active['cum_pnl'], label='Cumulative PnL (Strategy)')
+    plt.plot(active['timestamp'], active['cum_pnl'], label='Cumulative PnL')
     plt.title(f'Strategy Performance (Acc: {accuracy:.2f}%)')
     plt.grid(True)
     plt.legend()
@@ -235,20 +238,18 @@ def printaccuracy(predictions_df):
     plot_url = base64.b64encode(img.getvalue()).decode()
     plt.close()
     
-    # --- HTML Generation ---
+    # HTML Table
     table_html = """
     <table border="1">
-    <tr><th>Entry Time</th><th>Pred</th><th>Entry Price</th><th>Exit Price</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th><th>Input Context (Last 3 Candles)</th></tr>
+    <tr><th>Entry Time</th><th>Pred</th><th>Entry Price</th><th>Exit Price</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th><th>Input Context</th></tr>
     """
     for _, row in active.tail(50).iterrows():
         p_str = "UP" if row['predicted_dir'] > 0 else "DOWN"
         color = "green" if row['is_correct'] else "red"
         
-        # Format input candles
         inputs_str = "<div style='font-size:0.8em'>"
-        if isinstance(row['input_candles'], list) and isinstance(row['input_timestamps'], list):
+        if isinstance(row['input_candles'], list):
             for t, c in zip(row['input_timestamps'], row['input_candles']):
-                # Round candle values for display
                 c_rounded = [round(x, 2) for x in c]
                 inputs_str += f"{t}: {c_rounded}<br>"
         inputs_str += "</div>"
@@ -258,12 +259,13 @@ def printaccuracy(predictions_df):
     
     html_out = f"<h3>Accuracy: {accuracy:.2f}% ({correct}/{total})</h3><img src='data:image/png;base64,{plot_url}'/><br>{table_html}"
 
-    # --- API Data Generation ---
-    equity_curve = active[['timestamp', 'cum_pnl']].copy()
+    # Stats Data
+    active_clean = active.where(pd.notnull(active), None)
+    equity_curve = active_clean[['timestamp', 'cum_pnl']].copy()
     equity_curve['timestamp'] = equity_curve['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
     
     trade_cols = ['timestamp', 'predicted_dir', 'entry_price', 'exit_price', 'actual_ret', 'is_correct', 'pnl', 'input_timestamps', 'input_candles']
-    trade_history = active[trade_cols].copy()
+    trade_history = active_clean[trade_cols].copy()
     trade_history['timestamp'] = trade_history['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
     
     stats_data = {
@@ -279,13 +281,12 @@ def printaccuracy(predictions_df):
     return html_out, stats_data
 
 def predict_on_recent(model_patterns, df_recent, e, d):
-    preds = completesimilarbeginnings(df_recent, model_patterns, e, d)
-    return preds
+    return completesimilarbeginnings(df_recent, model_patterns, e, d)
 
 # --- Live Loop ---
 
 def get_seconds_to_sleep(timeframe):
-    now = datetime.now(timezone.utc).replace(tzinfo=None) # naive UTC for calc
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     unit = timeframe[-1]
     val = int(timeframe[:-1])
     
@@ -294,7 +295,6 @@ def get_seconds_to_sleep(timeframe):
     elif unit == 'd': delta = timedelta(days=val)
     else: delta = timedelta(hours=1)
 
-    # Calculate next close alignment
     if unit == 'h':
         next_hour = now.replace(minute=0, second=0, microsecond=0) + delta
         while next_hour < now: next_hour += delta
@@ -321,23 +321,25 @@ def live_loop():
             exchange = ccxt.binance()
             limit = D * 5
             candles = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
+            
             df_live = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df_live['timestamp'] = pd.to_datetime(df_live['timestamp'], unit='ms')
+            cols = ['open', 'high', 'low', 'close', 'volume']
+            df_live[cols] = df_live[cols].astype(float)
             
+            # Unified derivation (padding index 0)
             df_derived = deriveround(df_live)
             
             # Step 1: Resolve previous prediction
             if len(live_outcomes) > 0 and 'outcome' not in live_outcomes[-1]:
                 last_pred = live_outcomes[-1]
                 
-                # Check if we have the specific close required
+                # We need at least 2 candles to have a valid return at index -1
                 if len(df_derived) >= 2:
-                    # Current last completed candle is -1
-                    
+                    # Index -1 is the just-closed candle (Outcome)
                     exit_price = df_live.iloc[-1]['close']
                     entry_price = last_pred.get('entry_price', exit_price)
                     
-                    # Simple PnL calc
                     raw_return = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
                     actual_dir = 1 if raw_return > 0 else -1
                     if raw_return == 0: actual_dir = 0
@@ -354,12 +356,17 @@ def live_loop():
             
             # Step 2: Make NEW prediction
             if len(df_derived) >= D:
-                # Context is the last D-1 candles
-                context_slice = df_derived.iloc[-(D-1):]
-                recent_context = context_slice[['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
-                recent_context_flat = recent_context.reshape(-1)
+                # Context is the last D-1 candles (Indices: -(D-1) to End)
+                # But wait, we predict the FUTURE candle.
+                # So we use the LAST D-1 completed candles as the "pattern".
                 
-                # Extract input sequence info (Raw OHLC)
+                context_slice = df_derived.iloc[-(D-1):]
+                
+                # Returns for matching
+                recent_context_ret = context_slice[['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
+                recent_context_flat = recent_context_ret.reshape(-1)
+                
+                # OHLC for logs
                 input_rows = df_live.loc[context_slice.index]
                 input_timestamps = input_rows['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
                 input_candles = input_rows[['open', 'high', 'low', 'close']].values.tolist()
@@ -370,7 +377,7 @@ def live_loop():
                 diff = np.abs(model_context_flat - recent_context_flat)
                 matches_idx = np.where(np.all(diff < E, axis=1))[0]
                 
-                # Entry price is the close of the last completed candle (matches context last close)
+                # Entry price is the CLOSE of the last candle we just saw
                 entry_price = df_live.iloc[-1]['close']
                 
                 if len(matches_idx) > 0:
@@ -382,7 +389,7 @@ def live_loop():
                     live_outcomes.append({
                         'time': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
                         'pred_dir': pred_dir,
-                        'matches': int(len(matches_idx)), # ensure int for JSON
+                        'matches': int(len(matches_idx)),
                         'entry_price': entry_price,
                         'input_timestamps': input_timestamps,
                         'input_candles': input_candles
@@ -407,55 +414,38 @@ def live_loop():
             traceback.print_exc()
             time.sleep(60)
 
-# --- Web Server & API ---
+# --- Web Server ---
 
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, datetime):
-            return obj.isoformat()
+        if isinstance(obj, np.integer): return int(obj)
+        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        if isinstance(obj, datetime): return obj.isoformat()
         return super().default(obj)
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         global results_html, live_outcomes, backtest_data, recent_data
         
-        # --- API Routes ---
         if self.path == '/api/current':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            data = live_outcomes[-1] if live_outcomes else {"status": "waiting for data"}
-            self.wfile.write(json.dumps(data, cls=CustomJSONEncoder).encode())
-            return
-            
+            self.send_json(live_outcomes[-1] if live_outcomes else {"status": "waiting"})
         elif self.path == '/api/live':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(live_outcomes, cls=CustomJSONEncoder).encode())
-            return
-            
+            self.send_json(live_outcomes)
         elif self.path == '/api/backtest':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(backtest_data, cls=CustomJSONEncoder).encode())
-            return
-            
+            self.send_json(backtest_data)
         elif self.path == '/api/recent':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(recent_data, cls=CustomJSONEncoder).encode())
-            return
+            self.send_json(recent_data)
+        else:
+            self.send_html()
 
-        # --- Default HTML Route ---
+    def send_json(self, data):
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, cls=CustomJSONEncoder).encode())
+
+    def send_html(self):
         live_html = "<h2>Live Outcomes (Last 2 weeks)</h2><table border='1'><tr><th>Time</th><th>Pred</th><th>Matches</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th><th>Input Context</th></tr>"
         for item in reversed(live_outcomes):
             outcome_str = item.get('outcome', 'Pending...')
@@ -463,10 +453,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             entry_s = f"{item.get('entry_price', 0):.2f}"
             exit_s = f"{item.get('exit_price', 0):.2f}" if 'exit_price' in item else "-"
             
-            # Format input candles
             inputs_str = "<div style='font-size:0.8em'>"
-            if 'input_candles' in item and 'input_timestamps' in item:
-                for t, c in zip(item['input_timestamps'], item['input_candles']):
+            if 'input_candles' in item:
+                for t, c in zip(item.get('input_timestamps', []), item.get('input_candles', [])):
                     c_rounded = [round(x, 2) for x in c]
                     inputs_str += f"{t}: {c_rounded}<br>"
             inputs_str += "</div>"
@@ -486,7 +475,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         {live_html}
         </body></html>
         """
-        
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
@@ -502,29 +490,30 @@ def run_server():
 def main():
     global model_sequences, results_html, data_global, backtest_data, recent_data
     
+    # 1. Fetch & Derive (Unified)
     df = fetch(TIMEFRAME, SYMBOL, START, END)
-    df_derived = deriveround(df, A)
-    data_global = df_derived
+    df = deriveround(df) # Pads index 0, length remains same
+    data_global = df
     
-    split1, split2 = split(df_derived, B)
+    # 2. Split
+    split1, split2 = split(df, B)
     print(f"Split 1 size: {len(split1)}, Split 2 size: {len(split2)}")
     
+    # 3. Train
     model_sequences = gettop(split1, C, D)
     print(f"Model trained. {len(model_sequences)} patterns retained.")
     
+    # 4. Predict Backtest
     preds = completesimilarbeginnings(split2, model_sequences, E, D)
+    html_split2, backtest_data = printaccuracy(preds)
     
-    # Use timezone-aware current time for recent data fetch to avoid deprecation warnings
+    # 5. Predict Recent
     now_utc = datetime.now(timezone.utc)
     recent_start = (now_utc - timedelta(days=14)).isoformat()
     recent_end = now_utc.isoformat()
-    
     df_recent = fetch(TIMEFRAME, SYMBOL, recent_start, recent_end)
-    df_recent_derived = deriveround(df_recent)
-    preds_recent = predict_on_recent(model_sequences, df_recent_derived, E, D)
-    
-    # Store both HTML and Data
-    html_split2, backtest_data = printaccuracy(preds)
+    df_recent = deriveround(df_recent)
+    preds_recent = predict_on_recent(model_sequences, df_recent, E, D)
     html_recent, recent_data = printaccuracy(preds_recent)
     
     results_html = f"""
@@ -535,6 +524,7 @@ def main():
     {html_recent}
     """
     
+    # 6. Launch
     t_live = threading.Thread(target=live_loop)
     t_live.daemon = True
     t_live.start()
