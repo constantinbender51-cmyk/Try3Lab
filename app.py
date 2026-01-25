@@ -15,7 +15,7 @@ DATA_FILE = os.path.join(DATA_DIR, 'ohlc.csv')
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '1h'
 SEQ_LEN = 3
-ROUNDING = 3  # 0.1% is 0.001, so 3 decimal places
+ROUNDING_STEP = 0.002  # 0.2%
 THRESHOLD = 0.005 # 0.5%
 PORT = 8080
 
@@ -57,10 +57,10 @@ def prepare_data(df):
     for col, n_col in zip(['open', 'high', 'low', 'close'], norm_cols):
         df[n_col] = df[col] / first_vals[col]
 
-    # 6. Round raw ohlc (normalized) and derivative version to 0.1% (3 decimal places)
-    # Note: 0.1% = 0.001
+    # 6. Round raw ohlc and derivative version to 0.2% (0.002)
+    # Logic: (Value / Step).round() * Step
     cols_to_round = deriv_cols + norm_cols
-    df[cols_to_round] = df[cols_to_round].round(ROUNDING)
+    df[cols_to_round] = (df[cols_to_round] / ROUNDING_STEP).round() * ROUNDING_STEP
 
     return df
 
