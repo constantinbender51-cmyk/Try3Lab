@@ -221,12 +221,22 @@ def printaccuracy(predictions_df):
     # --- HTML Generation ---
     table_html = """
     <table border="1">
-    <tr><th>Date</th><th>Pred</th><th>Entry</th><th>Exit</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th></tr>
+    <tr><th>Date</th><th>Pred</th><th>Entry</th><th>Exit</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th><th>Input Context</th></tr>
     """
     for _, row in active.tail(50).iterrows():
         p_str = "UP" if row['predicted_dir'] > 0 else "DOWN"
         color = "green" if row['is_correct'] else "red"
-        table_html += f"<tr><td>{row['timestamp']}</td><td>{p_str}</td><td>{row['entry_price']:.2f}</td><td>{row['exit_price']:.2f}</td><td>{row['actual_ret']:.4f}</td><td style='color:{color}'>{row['is_correct']}</td><td>{row['pnl']:.4f}</td></tr>"
+        
+        # Format input candles
+        inputs_str = "<div style='font-size:0.8em'>"
+        if isinstance(row['input_candles'], list) and isinstance(row['input_timestamps'], list):
+            for t, c in zip(row['input_timestamps'], row['input_candles']):
+                # Round candle values for display
+                c_rounded = [round(x, 2) for x in c]
+                inputs_str += f"{t}: {c_rounded}<br>"
+        inputs_str += "</div>"
+        
+        table_html += f"<tr><td>{row['timestamp']}</td><td>{p_str}</td><td>{row['entry_price']:.2f}</td><td>{row['exit_price']:.2f}</td><td>{row['actual_ret']:.4f}</td><td style='color:{color}'>{row['is_correct']}</td><td>{row['pnl']:.4f}</td><td>{inputs_str}</td></tr>"
     table_html += "</table>"
     
     html_out = f"<h3>Accuracy: {accuracy:.2f}% ({correct}/{total})</h3><img src='data:image/png;base64,{plot_url}'/><br>{table_html}"
@@ -423,15 +433,23 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
 
         # --- Default HTML Route ---
-        live_html = "<h2>Live Outcomes (Last 2 weeks)</h2><table border='1'><tr><th>Time</th><th>Pred</th><th>Matches</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th></tr>"
+        live_html = "<h2>Live Outcomes (Last 2 weeks)</h2><table border='1'><tr><th>Time</th><th>Pred</th><th>Matches</th><th>Entry</th><th>Exit</th><th>Outcome</th><th>PnL</th><th>Input Context</th></tr>"
         for item in reversed(live_outcomes):
             outcome_str = item.get('outcome', 'Pending...')
             pnl_str = f"{item.get('pnl', 0):.4f}" if 'pnl' in item else "-"
             entry_s = f"{item.get('entry_price', 0):.2f}"
             exit_s = f"{item.get('exit_price', 0):.2f}" if 'exit_price' in item else "-"
             
+            # Format input candles
+            inputs_str = "<div style='font-size:0.8em'>"
+            if 'input_candles' in item and 'input_timestamps' in item:
+                for t, c in zip(item['input_timestamps'], item['input_candles']):
+                    c_rounded = [round(x, 2) for x in c]
+                    inputs_str += f"{t}: {c_rounded}<br>"
+            inputs_str += "</div>"
+            
             pred_s = "UP" if item['pred_dir'] == 1 else ("DOWN" if item['pred_dir'] == -1 else "FLAT")
-            live_html += f"<tr><td>{item['time']}</td><td>{pred_s}</td><td>{item['matches']}</td><td>{entry_s}</td><td>{exit_s}</td><td>{outcome_str}</td><td>{pnl_str}</td></tr>"
+            live_html += f"<tr><td>{item['time']}</td><td>{pred_s}</td><td>{item['matches']}</td><td>{entry_s}</td><td>{exit_s}</td><td>{outcome_str}</td><td>{pnl_str}</td><td>{inputs_str}</td></tr>"
         live_html += "</table>"
         
         full_page = f"""
