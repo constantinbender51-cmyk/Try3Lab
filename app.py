@@ -166,15 +166,19 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
             actual_dir = 1 if actual_ret > 0 else -1
             if actual_ret == 0: actual_dir = 0
             
-            # Use Entry Time (index -2) as the trade timestamp to align with inputs
-            ts = pd.to_datetime(target_ts[i, -2])
+            # --- FIX: Align Entry Time to the Start of the Outcome Candle ---
+            # Index -1 corresponds to the outcome candle (the one we are predicting)
+            ts = pd.to_datetime(target_ts[i, -1])
             
             # Prices
+            # Entry price is the Close of the last context candle (Index -2)
+            # or equivalently the Open of the outcome candle (Index -1)
+            # We use Close of previous (-2) to simulate instant fill on candle close.
             entry_price = target_prices[i, -2]
             exit_price = target_prices[i, -1]
             
             # Input Sequence (timestamps and OHLC)
-            # Indices 0 to D-2 (inclusive)
+            # Indices 0 to D-2 (inclusive) are the Context.
             input_timestamps = pd.to_datetime(target_ts[i, :d-1]).strftime('%Y-%m-%d %H:%M:%S').tolist()
             input_candles = target_ohlc[i, :d-1].tolist()
 
@@ -224,7 +228,6 @@ def printaccuracy(predictions_df):
     plt.close()
     
     # --- HTML Generation ---
-    # Updated Headers to clarify Entry vs Exit
     table_html = """
     <table border="1">
     <tr><th>Entry Time</th><th>Pred</th><th>Entry Price</th><th>Exit Price</th><th>Actual Ret</th><th>Outcome</th><th>PnL</th><th>Input Context (Last 3 Candles)</th></tr>
