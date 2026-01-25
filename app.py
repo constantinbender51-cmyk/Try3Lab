@@ -129,13 +129,10 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
     timestamps = df_target['timestamp'].values
     ohlc_values = df_target[ohlc_cols].values
     
-    # Extract raw close prices for entry/exit logging
-    close_prices = df_target['close'].values
-    
+    # Create sliding views for ALL data types to ensure alignment
     target_windows = np.lib.stride_tricks.sliding_window_view(target_values, window_shape=d, axis=0)
     target_ts = np.lib.stride_tricks.sliding_window_view(timestamps, window_shape=d, axis=0)
     target_ohlc = np.lib.stride_tricks.sliding_window_view(ohlc_values, window_shape=d, axis=0)
-    target_prices = np.lib.stride_tricks.sliding_window_view(close_prices, window_shape=d, axis=0)
     
     predictions = []
     
@@ -159,26 +156,27 @@ def completesimilarbeginnings(df_target, model_patterns, e, d):
             if avg_return == 0: predicted_dir = 0
             
             # Outcome
-            # The window is [t-3, t-2, t-1, t]. 
-            # We predict at t-1 (entry).
-            # Outcome is at t.
+            # The window is [0, 1 ... D-1]
+            # Prediction Target is Index D-1 (Last candle)
             actual_ret = current_window[-1, 3] 
             actual_dir = 1 if actual_ret > 0 else -1
             if actual_ret == 0: actual_dir = 0
             
-            # --- FIX: Align Entry Time to the Start of the Outcome Candle ---
-            # Index -1 corresponds to the outcome candle (the one we are predicting)
+            # Entry Time: The start of the outcome candle (Index -1)
             ts = pd.to_datetime(target_ts[i, -1])
             
-            # Prices
-            # Entry price is the Close of the last context candle (Index -2)
-            # or equivalently the Open of the outcome candle (Index -1)
-            # We use Close of previous (-2) to simulate instant fill on candle close.
-            entry_price = target_prices[i, -2]
-            exit_price = target_prices[i, -1]
+            # Prices: Source directly from target_ohlc to match the context
+            # Column indices: 0:Open, 1:High, 2:Low, 3:Close
+            
+            # Entry Price: Close of the LAST CONTEXT candle (Index -2)
+            # This corresponds to entering at the exact moment the context pattern completes.
+            entry_price = target_ohlc[i, -2, 3] 
+            
+            # Exit Price: Close of the OUTCOME candle (Index -1)
+            exit_price = target_ohlc[i, -1, 3]
             
             # Input Sequence (timestamps and OHLC)
-            # Indices 0 to D-2 (inclusive) are the Context.
+            # Indices 0 to D-2 (inclusive)
             input_timestamps = pd.to_datetime(target_ts[i, :d-1]).strftime('%Y-%m-%d %H:%M:%S').tolist()
             input_candles = target_ohlc[i, :d-1].tolist()
 
@@ -323,18 +321,8 @@ def live_loop():
                 last_pred = live_outcomes[-1]
                 
                 # Check if we have the specific close required
-                # Last pred was made at df_live.iloc[-2] (conceptually)
-                # We need the close of the next candle
-                
                 if len(df_derived) >= 2:
                     # Current last completed candle is -1
-                    # If this matches the prediction interval
-                    
-                    actual_close_ret = df_derived.iloc[-1]['close_ret'] # Most recent completed return
-                    
-                    # We need to verify if this is indeed the candle AFTER the entry
-                    # In live loop, we wake up after a candle closes.
-                    # df_live[-1] is the just-closed candle.
                     
                     exit_price = df_live.iloc[-1]['close']
                     entry_price = last_pred.get('entry_price', exit_price)
@@ -355,28 +343,13 @@ def live_loop():
                     last_pred['exit_price'] = exit_price
             
             # Step 2: Make NEW prediction
-            # We use the LAST D candles as the window. 
-            # D-1 candles are context. 
-            # We predict the NEXT candle (which hasn't happened yet).
-            # Wait, the model predicts the *last* component of a sequence of D.
-            # So we supply D-1 inputs, and predict D.
-            
             if len(df_derived) >= D:
-                # We want to predict the candle starting NOW.
-                # So we take the last D-1 completed candles as context.
-                
-                # df_derived includes returns for the just-closed candle at index -1.
-                # So context is df_derived.iloc[-(D-1):]
-                
+                # Context is the last D-1 candles
                 context_slice = df_derived.iloc[-(D-1):]
                 recent_context = context_slice[['open_ret', 'high_ret', 'low_ret', 'close_ret']].values
                 recent_context_flat = recent_context.reshape(-1)
                 
                 # Extract input sequence info (Raw OHLC)
-                # These are the candles corresponding to the returns in context_slice
-                # context_slice indices match df_live indices (if aligned).
-                # deriveround drops index 0.
-                
                 input_rows = df_live.loc[context_slice.index]
                 input_timestamps = input_rows['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
                 input_candles = input_rows[['open', 'high', 'low', 'close']].values.tolist()
@@ -387,7 +360,7 @@ def live_loop():
                 diff = np.abs(model_context_flat - recent_context_flat)
                 matches_idx = np.where(np.all(diff < E, axis=1))[0]
                 
-                # Entry price is the close of the last completed candle
+                # Entry price is the close of the last completed candle (matches context last close)
                 entry_price = df_live.iloc[-1]['close']
                 
                 if len(matches_idx) > 0:
