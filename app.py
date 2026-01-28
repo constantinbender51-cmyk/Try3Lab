@@ -1,618 +1,676 @@
-import http.server
-import socketserver
 import pandas as pd
 import numpy as np
-import requests
 import matplotlib.pyplot as plt
 import io
 import base64
-import time
-import sys
-import math
-from datetime import datetime, timedelta
-from collections import Counter, defaultdict
-import json
+import random
+import http.server
+import socketserver
+import warnings
+import requests
 import threading
-import os
-import csv
+import time
+import json
+import urllib.parse
+from datetime import datetime, timedelta
+from deap import base, creator, tools, algorithms
 
-# ---------------------------------------------------------
-# 7. Parameters (Environment Variables)
-# ---------------------------------------------------------
-SYMBOL = os.getenv("SYMBOL", 'SHIBUSDT')
-INTERVAL = os.getenv("INTERVAL", '1h')
-START_TIME = os.getenv("START_TIME", '2024-01-01')
-END_TIME = os.getenv("END_TIME", '2026-01-01')
-PORT = int(os.getenv("PORT", 8080))
-TRAIN_SPLIT_RATIO = float(os.getenv("TRAIN_SPLIT_RATIO", 0.7))
+# --- Configuration ---
+BASE_DATA_URL = "https://ohlcendpoint.up.railway.app/data"
+PORT = 8080
+N_LINES = 200
+POPULATION_SIZE = 40
+GENERATIONS = 10
+RISK_FREE_RATE = 0.0
 
-# Parse Grid Search Values from Env (comma separated) or use default
-_grid_env = os.getenv("GRID_SEARCH_VALUES")
-if _grid_env:
-    GRID_SEARCH_VALUES = [float(x.strip()) for x in _grid_env.split(',')]
-else:
-    # Default: 0.1% to 5%
-    GRID_SEARCH_VALUES = [0.001, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]
+# Ranges
+STOP_PCT_RANGE = (0.001, 0.02)   # 0.1% to 2%
+PROFIT_PCT_RANGE = (0.0004, 0.05) # 0.04% to 5%
+
+warnings.filterwarnings("ignore")
+
+# Asset List Mapping (Symbol -> Binance Pair & CSV Prefix)
+ASSETS = [
+    {"symbol": "BTC", "pair": "BTCUSDT", "csv": "btc1m.csv"},
+    {"symbol": "ETH", "pair": "ETHUSDT", "csv": "eth1m.csv"},
+    {"symbol": "XRP", "pair": "XRPUSDT", "csv": "xrp1m.csv"},
+    {"symbol": "SOL", "pair": "SOLUSDT", "csv": "sol1m.csv"},
+    {"symbol": "DOGE", "pair": "DOGEUSDT", "csv": "doge1m.csv"},
+    {"symbol": "ADA", "pair": "ADAUSDT", "csv": "ada1m.csv"},
+    {"symbol": "BCH", "pair": "BCHUSDT", "csv": "bch1m.csv"},
+    {"symbol": "LINK", "pair": "LINKUSDT", "csv": "link1m.csv"},
+    {"symbol": "XLM", "pair": "XLMUSDT", "csv": "xlm1m.csv"},
+    {"symbol": "SUI", "pair": "SUIUSDT", "csv": "sui1m.csv"},
+    {"symbol": "AVAX", "pair": "AVAXUSDT", "csv": "avax1m.csv"},
+    {"symbol": "LTC", "pair": "LTCUSDT", "csv": "ltc1m.csv"},
+    {"symbol": "HBAR", "pair": "HBARUSDT", "csv": "hbar1m.csv"},
+    {"symbol": "SHIB", "pair": "SHIBUSDT", "csv": "shib1m.csv"},
+    {"symbol": "TON", "pair": "TONUSDT", "csv": "ton1m.csv"},
+]
 
 # Global Storage
-GLOBAL_BEST_RESULT = None
-GLOBAL_PLOT_B64 = None
-GLOBAL_MODEL = {} 
-GLOBAL_GRID_SIZE = 0.0
-GLOBAL_PRECISION = 8
-GLOBAL_LIVE_LOG = [] # In-memory store for live predictions
+# Key: Symbol (str) -> Value: HTML String
+HTML_REPORTS = {} 
+# Key: Symbol (str) -> Value: Dict of params
+BEST_PARAMS = {}
+# Lock for thread-safe updates to globals
+REPORT_LOCK = threading.Lock()
 
-# ---------------------------------------------------------
-# 1. Fetch Data
-# ---------------------------------------------------------
-def fetch_binance_data(symbol, interval, start_str, end_str=None, limit=1000):
-    base_url = "https://api.binance.com/api/v3/klines"
-    
-    if end_str:
-        print(f"Fetching {symbol} {interval} data from {start_str} to {end_str}...")
-        start_ts = int(pd.Timestamp(start_str).timestamp() * 1000)
-        end_ts = int(pd.Timestamp(end_str).timestamp() * 1000)
+# --- 1. DEAP Initialization (Global Scope) ---
+# Must be done once globally, not inside loops/functions
+creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+creator.create("Individual", list, fitness=creator.FitnessMax)
+
+# --- 2. Precise Data Ingestion ---
+def get_data(csv_filename):
+    url = f"{BASE_DATA_URL}/{csv_filename}"
+    print(f"Downloading data from {url}...")
+    try:
+        df = pd.read_csv(url)
+        df.columns = [c.lower().strip() for c in df.columns]
         
-        all_data = []
-        while start_ts < end_ts:
-            params = {
-                'symbol': symbol,
-                'interval': interval,
-                'startTime': start_ts,
-                'endTime': end_ts,
-                'limit': limit
+        if 'datetime' in df.columns:
+            df['dt'] = pd.to_datetime(df['datetime'], errors='coerce')
+        elif 'timestamp' in df.columns:
+            df['dt'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
+        else:
+            raise ValueError("No valid date column found.")
+
+        df.dropna(subset=['dt', 'open', 'high', 'low', 'close'], inplace=True)
+        df.set_index('dt', inplace=True)
+        df.sort_index(inplace=True)
+
+        print(f"[{csv_filename}] Raw 1m Data: {len(df)} rows")
+
+        # Keeping 1H resampling for GA Optimization speed
+        # The live bot will run on 1m, but we optimize on 1H to avoid 
+        # waiting hours for the script to start.
+        df_1h = df.resample('1h').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last'
+        }).dropna()
+
+        print(f"[{csv_filename}] Resampled 1H Data (For GA): {len(df_1h)} rows")
+        
+        if len(df_1h) < 100:
+            raise ValueError("Data insufficient after resampling.")
+
+        split_idx = int(len(df_1h) * 0.85)
+        train = df_1h.iloc[:split_idx]
+        test = df_1h.iloc[split_idx:]
+        
+        return train, test
+
+    except Exception as e:
+        print(f"CRITICAL DATA ERROR for {csv_filename}: {e}")
+        return None, None
+
+# --- 3. Strategy Logic ---
+def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
+    closes = df['close'].values
+    highs = df['high'].values
+    lows = df['low'].values
+    times = df.index
+    
+    equity = 10000.0
+    equity_curve = [equity]
+    position = 0          # 0: Flat, 1: Long, -1: Short
+    entry_price = 0.0
+    
+    trades = []
+    hourly_log = []
+    
+    lines = np.sort(lines)
+    trades_completed = 0
+    
+    for i in range(1, len(df)):
+        current_c = closes[i]
+        current_h = highs[i]
+        current_l = lows[i]
+        prev_c = closes[i-1]
+        ts = times[i]
+        
+        # --- Detailed Logging ---
+        if detailed_log_trades > 0 and trades_completed < detailed_log_trades:
+            idx = np.searchsorted(lines, current_c)
+            val_below = lines[idx-1] if idx > 0 else -999.0
+            val_above = lines[idx] if idx < len(lines) else 999999.0
+            
+            act_sl = np.nan
+            act_tp = np.nan
+            pos_str = "FLAT"
+            
+            if position == 1:
+                pos_str = "LONG"
+                act_sl = entry_price * (1 - stop_pct)
+                act_tp = entry_price * (1 + profit_pct)
+            elif position == -1:
+                pos_str = "SHORT"
+                act_sl = entry_price * (1 + stop_pct)
+                act_tp = entry_price * (1 - profit_pct)
+            
+            log_entry = {
+                "Timestamp": str(ts),
+                "Price": f"{current_c:.2f}",
+                "Nearest Below": f"{val_below:.2f}" if val_below != -999 else "None",
+                "Nearest Above": f"{val_above:.2f}" if val_above != 999999 else "None",
+                "Position": pos_str,
+                "Active SL": f"{act_sl:.2f}" if not np.isnan(act_sl) else "-",
+                "Active TP": f"{act_tp:.2f}" if not np.isnan(act_tp) else "-",
+                "Equity": f"{equity:.2f}"
             }
-            try:
-                response = requests.get(base_url, params=params)
-                data = response.json()
-                if not isinstance(data, list) or len(data) == 0:
-                    break
-                all_data.extend(data)
-                last_close_time = data[-1][6]
-                start_ts = last_close_time + 1
-                time.sleep(0.05) 
-                sys.stdout.write(f"\rFetched {len(all_data)} candles...")
-                sys.stdout.flush()
-            except Exception as e:
-                print(f"Error fetching data: {e}")
-                break
-        print("\nData fetch complete.")
-        
-    else:
-        # Live mode
-        params = {'symbol': symbol, 'interval': interval, 'limit': 5}
-        try:
-            response = requests.get(base_url, params=params)
-            all_data = response.json()
-        except Exception as e:
-            print(f"Error fetching live data: {e}")
-            return pd.DataFrame()
+            hourly_log.append(log_entry)
 
-    df = pd.DataFrame(all_data, columns=[
-        'open_time', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'trades', 
-        'taker_buy_base', 'taker_buy_quote', 'ignore'
-    ])
-    
-    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
-    df['close'] = df['close'].astype(float)
-    
-    return df[['open_time', 'close']]
+        # --- Strategy Execution ---
+        if position != 0:
+            sl_hit = False
+            tp_hit = False
+            exit_price = 0.0
+            reason = ""
 
-# ---------------------------------------------------------
-# Helper: Sharpe Calculation
-# ---------------------------------------------------------
-def calculate_sharpe_ratio(returns_series, periods_per_year=24*365):
-    if len(returns_series) < 2:
-        return 0.0
-    mean_ret = np.mean(returns_series)
-    std_ret = np.std(returns_series)
-    if std_ret == 0:
-        return 0.0
-    return (mean_ret / std_ret) * np.sqrt(periods_per_year)
-
-# ---------------------------------------------------------
-# Processing & Backtesting Logic
-# ---------------------------------------------------------
-def train_model(df, grid_size, needed_precision):
-    df = df.copy()
-    df['rounded_close'] = ((df['close'] / grid_size).round() * grid_size).round(needed_precision)
-    df['next_rounded'] = df['rounded_close'].shift(-1)
-    
-    conditions = [
-        df['next_rounded'] > df['rounded_close'],
-        df['next_rounded'] < df['rounded_close']
-    ]
-    choices = ['UP', 'DOWN']
-    df['target_direction'] = np.select(conditions, choices, default='FLAT')
-    
-    df['t_0'] = df['rounded_close']
-    df['t_1'] = df['rounded_close'].shift(1)
-    df['t_2'] = df['rounded_close'].shift(2)
-    
-    data = df.dropna().copy()
-    
-    sequence_map = defaultdict(list)
-    for _, row in data.iterrows():
-        seq = (row['t_2'], row['t_1'], row['t_0'])
-        sequence_map[seq].append(row['target_direction'])
-        
-    final_model = {}
-    for seq, directions in sequence_map.items():
-        counts = Counter(directions)
-        most_common = counts.most_common(1)[0][0]
-        final_model[seq] = most_common
-        
-    return final_model
-
-def evaluate_strategy(df_original, grid_percent, verbose=False):
-    df = df_original.copy()
-    first_close = df['close'].iloc[0]
-    grid_size = first_close * grid_percent
-    
-    if grid_size == 0:
-        needed_precision = 8
-    else:
-        needed_precision = int(math.ceil(-math.log10(grid_size))) + 2
-    needed_precision = max(2, min(needed_precision, 10))
-    
-    df['rounded_close'] = ((df['close'] / grid_size).round() * grid_size).round(needed_precision)
-    df['next_rounded'] = df['rounded_close'].shift(-1)
-    df['next_close_raw'] = df['close'].shift(-1)
-    
-    conditions = [
-        df['next_rounded'] > df['rounded_close'],
-        df['next_rounded'] < df['rounded_close']
-    ]
-    choices = ['UP', 'DOWN']
-    df['target_direction'] = np.select(conditions, choices, default='FLAT')
-    
-    df['t_0'] = df['rounded_close']
-    df['t_1'] = df['rounded_close'].shift(1)
-    df['t_2'] = df['rounded_close'].shift(2)
-
-    df['raw_t_0'] = df['close']
-    df['raw_t_1'] = df['close'].shift(1)
-    df['raw_t_2'] = df['close'].shift(2)
-    
-    data = df.dropna().copy()
-    split_idx = int(len(data) * TRAIN_SPLIT_RATIO)
-    train_df = data.iloc[:split_idx]
-    test_df = data.iloc[split_idx:]
-    
-    sequence_map = defaultdict(list)
-    for _, row in train_df.iterrows():
-        seq = (row['t_2'], row['t_1'], row['t_0'])
-        sequence_map[seq].append(row['target_direction'])
-        
-    model = {}
-    for seq, directions in sequence_map.items():
-        counts = Counter(directions)
-        model[seq] = counts.most_common(1)[0][0]
-        
-    correct_predictions = 0
-    total_predictions = 0
-    cumulative_pnl = 0.0
-    
-    test_results_list = []
-    hourly_returns = []
-    
-    for idx, row in test_df.iterrows():
-        seq = (row['t_2'], row['t_1'], row['t_0'])
-        prediction = model.get(seq, 'FLAT') 
-        actual = row['target_direction']
-        
-        # --- ACCURACY CALCULATION LOGIC ---
-        # Ignore if Prediction is FLAT or Actual Outcome is FLAT
-        if prediction != 'FLAT' and actual != 'FLAT':
-            if prediction == actual:
-                correct_predictions += 1
-            total_predictions += 1
-        
-        curr_price = row['close']
-        next_price = row['next_close_raw']
-        
-        trade_pnl = 0.0
-        # PnL logic remains: we trade if prediction is UP/DOWN. 
-        # If prediction was UP but actual was FLAT, we likely lose a small amount (spread/noise) 
-        # or gain small amount, calculated by raw price diff.
-        if prediction == 'UP':
-            trade_pnl = next_price - curr_price
-        elif prediction == 'DOWN':
-            trade_pnl = curr_price - next_price
-            
-        cumulative_pnl += trade_pnl
-        hourly_returns.append(trade_pnl / curr_price if curr_price > 0 else 0)
-        
-        test_results_list.append({
-            'time_t': row['open_time'],
-            'rnd_t_2': row['t_2'],
-            'rnd_t_1': row['t_1'],
-            'rnd_t_0': row['t_0'],
-            'raw_t_2': row['raw_t_2'],
-            'raw_t_1': row['raw_t_1'],
-            'raw_t_0': row['raw_t_0'],
-            'prediction': prediction,
-            'actual': actual,
-            'pnl': trade_pnl,
-            'cum_pnl': cumulative_pnl,
-            'next_price_raw': next_price
-        })
-        
-    accuracy = (correct_predictions / total_predictions) * 100 if total_predictions > 0 else 0
-    sharpe = calculate_sharpe_ratio(hourly_returns)
-    
-    return {
-        'sharpe': sharpe,
-        'accuracy': accuracy,
-        'cumulative_pnl': cumulative_pnl,
-        'grid_size': grid_size,
-        'needed_precision': needed_precision,
-        'test_results': test_results_list,
-        'grid_percent': grid_percent
-    }
-
-def run_grid_search(df):
-    print(f"\n--- Starting Grid Search for Sharpe Optimization ---")
-    print(f"Values to test: {GRID_SEARCH_VALUES}")
-    best_sharpe = -float('inf')
-    best_result = None
-    
-    for gp in GRID_SEARCH_VALUES:
-        res = evaluate_strategy(df, gp, verbose=False)
-        print(f"Grid: {gp*100:5.2f}% | Sharpe: {res['sharpe']:6.3f} | Acc: {res['accuracy']:5.2f}% | PnL: {res['cumulative_pnl']:8.4f}")
-        if res['sharpe'] > best_sharpe:
-            best_sharpe = res['sharpe']
-            best_result = res
-            
-    print("-" * 60)
-    print(f"Best Grid Percent: {best_result['grid_percent']*100}% with Sharpe: {best_result['sharpe']:.4f}")
-    return best_result
-
-# ---------------------------------------------------------
-# Visualization & Server
-# ---------------------------------------------------------
-def create_plot(df, test_results, accuracy, total_pnl, symbol, grid_percent):
-    plt.figure(figsize=(12, 6))
-    plt.plot(df['open_time'], df['close'], label='Price', color='gray', alpha=0.3)
-    
-    test_times = [x['time_t'] for x in test_results]
-    test_pnl = [x['cum_pnl'] for x in test_results]
-    
-    ax1 = plt.gca()
-    ax2 = ax1.twinx()
-    ax2.plot(test_times, test_pnl, label='Strategy PnL', color='blue', linewidth=1.5)
-    
-    ax1.set_ylabel('Price (USDT)')
-    ax2.set_ylabel('Cumulative PnL (USDT)')
-    plt.title(f'Optimized Backtest: {symbol} (Grid={grid_percent*100}%) | Acc: {accuracy:.2f}% | PnL: {total_pnl:.6f}')
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    image_base64 = base64.b64encode(buf.read()).decode('utf-8')
-    plt.close()
-    return image_base64
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Binance Strategy Dashboard</title>
-    <style>
-        body {{ font-family: monospace; margin: 20px; color: #333; }}
-        .container {{ max-width: 95%; margin: 0 auto; }}
-        img {{ max-width: 100%; height: auto; border: 1px solid #ccc; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 12px; }}
-        th, td {{ padding: 6px 10px; text-align: left; border-bottom: 1px solid #ddd; }}
-        th {{ background-color: #eee; }}
-        .pagination {{ margin-top: 20px; text-align: center; }}
-        button {{ padding: 5px 15px; margin: 0 5px; cursor: pointer; }}
-        .up {{ color: green; font-weight: bold; }}
-        .down {{ color: red; font-weight: bold; }}
-        .stats {{ background: #f4f4f4; padding: 15px; border-radius: 4px; margin-bottom: 20px; }}
-        .raw-price {{ color: #666; font-style: italic; }}
-        .highlight {{ color: #007bff; font-weight: bold; }}
-        .section-header {{ margin-top: 40px; border-bottom: 2px solid #333; padding-bottom: 5px; }}
-        .live-tag {{ background: #ff4444; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; vertical-align: middle; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>Strategy Dashboard: {symbol}</h2>
-        
-        <div class="stats">
-            <strong>Interval:</strong> {interval} | 
-            <strong>Start:</strong> {start} | 
-            <strong>End:</strong> {end} <br>
-            <strong>Optimized Grid:</strong> <span class="highlight">{grid_percent:.2f}%</span> (Size: {grid_size}) <br>
-            <strong>Sharpe Ratio:</strong> <span class="highlight">{sharpe:.4f}</span> |
-            <strong>Directional Accuracy:</strong> {accuracy:.2f}% (Excl. Flat) | 
-            <strong>Total PnL:</strong> {pnl} USDT
-        </div>
-
-        <h3 class="section-header">Live Monitor <span class="live-tag">ACTIVE</span></h3>
-        <p><em>Updates every hour. Most recent predictions from the active loop.</em></p>
-        <table>
-            <thead>
-                <tr>
-                    <th>Timestamp</th>
-                    <th>Close Price</th>
-                    <th>Pattern Sequence</th>
-                    <th>Predicted Direction</th>
-                </tr>
-            </thead>
-            <tbody>
-                {live_rows}
-            </tbody>
-        </table>
-
-        <h3 class="section-header">Backtest Performance</h3>
-        <img src="data:image/png;base64,{plot_data}" />
-
-        <h3>Backtest Log</h3>
-        <div class="pagination">
-            <button onclick="prevPage()">Previous</button>
-            <span id="pageInfoTop"></span>
-            <button onclick="nextPage()">Next</button>
-        </div>
-        
-        <table id="resultsTable">
-            <thead>
-                <tr>
-                    <th>Time (T)</th>
-                    <th>Raw Input [T-2, T-1, T]</th>
-                    <th>Grid Input [T-2, T-1, T]</th>
-                    <th>Prediction</th>
-                    <th>Target Raw (T+1)</th>
-                    <th>Actual Dir</th>
-                    <th>PnL</th>
-                </tr>
-            </thead>
-            <tbody id="tableBody"></tbody>
-        </table>
-    </div>
-
-    <script>
-        const data = {json_data};
-        const rowsPerPage = 50;
-        let currentPage = 1;
-        const precision = {precision}; 
-
-        function renderTable() {{
-            const tbody = document.getElementById('tableBody');
-            tbody.innerHTML = '';
-            const start = (currentPage - 1) * rowsPerPage;
-            const end = start + rowsPerPage;
-            const pageData = data.slice(start, end);
-
-            pageData.forEach(row => {{
-                const tr = document.createElement('tr');
-                const predClass = row.prediction === 'UP' ? 'up' : (row.prediction === 'DOWN' ? 'down' : '');
-                const actualClass = row.actual === 'UP' ? 'up' : (row.actual === 'DOWN' ? 'down' : '');
-                const pnlColor = row.pnl >= 0 ? 'green' : 'red';
-                const rawP = precision + 2; 
+            if position == 1: # Long Logic
+                sl_price = entry_price * (1 - stop_pct)
+                tp_price = entry_price * (1 + profit_pct)
                 
-                tr.innerHTML = `
-                    <td>${{row.time_t}}</td>
-                    <td class="raw-price">[${{row.raw_t_2.toFixed(rawP)}}, ${{row.raw_t_1.toFixed(rawP)}}, ${{row.raw_t_0.toFixed(rawP)}}]</td>
-                    <td>[${{row.rnd_t_2.toFixed(precision)}}, ${{row.rnd_t_1.toFixed(precision)}}, ${{row.rnd_t_0.toFixed(precision)}}]</td>
-                    <td class="${{predClass}}">${{row.prediction}}</td>
-                    <td>${{row.next_price_raw.toFixed(rawP)}}</td>
-                    <td class="${{actualClass}}">${{row.actual}}</td>
-                    <td style="color: ${{pnlColor}}">${{row.pnl.toFixed(precision)}}</td>
-                `;
-                tbody.appendChild(tr);
-            }});
-            const info = `Page ${{currentPage}} of ${{Math.ceil(data.length / rowsPerPage)}}`;
-            document.getElementById('pageInfoTop').innerText = info;
-        }}
+                # Check Low for SL, High for TP
+                if current_l <= sl_price:
+                    sl_hit = True; exit_price = sl_price 
+                elif current_h >= tp_price:
+                    tp_hit = True; exit_price = tp_price
 
-        function prevPage() {{ if (currentPage > 1) {{ currentPage--; renderTable(); }} }}
-        function nextPage() {{ if (currentPage * rowsPerPage < data.length) {{ currentPage++; renderTable(); }} }}
-        renderTable();
-    </script>
-</body>
-</html>
-"""
+            elif position == -1: # Short Logic
+                sl_price = entry_price * (1 + stop_pct)
+                tp_price = entry_price * (1 - profit_pct)
+                
+                # Check High for SL, Low for TP
+                if current_h >= sl_price:
+                    sl_hit = True; exit_price = sl_price
+                elif current_l <= tp_price:
+                    tp_hit = True; exit_price = tp_price
+            
+            if sl_hit or tp_hit:
+                if position == 1: pn_l = (exit_price - entry_price) / entry_price
+                else: pn_l = (entry_price - exit_price) / entry_price
+                
+                equity *= (1 + pn_l)
+                reason = "SL" if sl_hit else "TP"
+                trades.append({'time': ts, 'type': 'Exit', 'price': exit_price, 'pnl': pn_l, 'equity': equity, 'reason': reason})
+                position = 0
+                trades_completed += 1
+                equity_curve.append(equity)
+                continue 
 
-class BacktestHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        
-        res = GLOBAL_BEST_RESULT
-        if not res:
-            self.wfile.write(b"Results not ready yet. Please wait for backtest to finish.")
-            return
+        if position == 0:
+            p_min = min(prev_c, current_c)
+            p_max = max(prev_c, current_c)
+            
+            idx_start = np.searchsorted(lines, p_min, side='right')
+            idx_end = np.searchsorted(lines, p_max, side='right')
+            
+            crossed_lines = lines[idx_start:idx_end]
+            
+            if len(crossed_lines) > 0:
+                target_line = 0.0
+                new_pos = 0
+                
+                if current_c > prev_c: 
+                    target_line = crossed_lines[0]
+                    new_pos = -1
+                elif current_c < prev_c:
+                    target_line = crossed_lines[-1]
+                    new_pos = 1
+                
+                if new_pos != 0:
+                    position = new_pos
+                    entry_price = target_line
+                    trades.append({'time': ts, 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
 
-        # Prepare Backtest Data
-        test_results = res['test_results']
-        needed_precision = res['needed_precision']
-        js_data = []
-        for r in test_results:
-            js_data.append({
-                'time_t': str(r['time_t']),
-                'raw_t_2': r['raw_t_2'], 'raw_t_1': r['raw_t_1'], 'raw_t_0': r['raw_t_0'],
-                'rnd_t_2': r['rnd_t_2'], 'rnd_t_1': r['rnd_t_1'], 'rnd_t_0': r['rnd_t_0'],
-                'prediction': r['prediction'],
-                'next_price_raw': r['next_price_raw'],
-                'actual': r['actual'], 'pnl': r['pnl']
-            })
-        json_str = json.dumps(js_data)
-        
-        # Prepare Live Log Rows
-        live_rows_html = ""
-        # Reverse to show newest first
-        for entry in reversed(GLOBAL_LIVE_LOG):
-            pred_class = "up" if entry['prediction'] == 'UP' else ("down" if entry['prediction'] == 'DOWN' else "")
-            live_rows_html += f"""
-                <tr>
-                    <td>{entry['timestamp']}</td>
-                    <td>{entry['close_price']}</td>
-                    <td>{entry['sequence']}</td>
-                    <td class="{pred_class}">{entry['prediction']}</td>
-                </tr>
-            """
-        
-        if not live_rows_html:
-            live_rows_html = "<tr><td colspan='4'>No live predictions yet. Next prediction scheduled.</td></tr>"
+        equity_curve.append(equity)
 
-        html_content = HTML_TEMPLATE.format(
-            symbol=SYMBOL,
-            interval=INTERVAL,
-            start=START_TIME,
-            end=END_TIME,
-            grid_size=f"{res['grid_size']:.{needed_precision}f}",
-            grid_percent=res['grid_percent']*100,
-            sharpe=res['sharpe'],
-            accuracy=res['accuracy'],
-            pnl=f"{res['cumulative_pnl']:.{needed_precision}f}",
-            plot_data=GLOBAL_PLOT_B64,
-            json_data=json_str,
-            precision=needed_precision,
-            live_rows=live_rows_html
-        )
-        self.wfile.write(html_content.encode('utf-8'))
+    return equity_curve, trades, hourly_log
 
-# ---------------------------------------------------------
-# Live Prediction Logic
-# ---------------------------------------------------------
-def save_live_prediction(timestamp, close_price, sequence, prediction):
+def calculate_sharpe(equity_curve):
+    if len(equity_curve) < 2: return -999.0
+    returns = pd.Series(equity_curve).pct_change().dropna()
+    if returns.std() == 0: return -999.0
+    return np.sqrt(8760) * (returns.mean() / returns.std())
+
+# --- 4. Genetic Algorithm ---
+def setup_toolbox(min_price, max_price, df_train):
+    toolbox = base.Toolbox()
+    toolbox.register("attr_stop", random.uniform, STOP_PCT_RANGE[0], STOP_PCT_RANGE[1])
+    toolbox.register("attr_profit", random.uniform, PROFIT_PCT_RANGE[0], PROFIT_PCT_RANGE[1])
+    toolbox.register("attr_line", random.uniform, min_price, max_price)
+
+    toolbox.register("individual", tools.initCycle, creator.Individual,
+                     (toolbox.attr_stop, toolbox.attr_profit) + (toolbox.attr_line,)*N_LINES, n=1)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+    
+    toolbox.register("evaluate", evaluate_genome, df_train=df_train)
+    toolbox.register("mate", tools.cxTwoPoint) 
+    toolbox.register("mutate", mutate_custom, indpb=0.1, min_p=min_price, max_p=max_price)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+    
+    return toolbox
+
+def evaluate_genome(individual, df_train):
+    stop_pct = np.clip(individual[0], STOP_PCT_RANGE[0], STOP_PCT_RANGE[1])
+    profit_pct = np.clip(individual[1], PROFIT_PCT_RANGE[0], PROFIT_PCT_RANGE[1])
+    lines = np.array(individual[2:])
+    eq_curve, _, _ = run_backtest(df_train, stop_pct, profit_pct, lines, detailed_log_trades=0)
+    return (calculate_sharpe(eq_curve),)
+
+def mutate_custom(individual, indpb, min_p, max_p):
+    if random.random() < indpb:
+        individual[0] = np.clip(individual[0] + random.gauss(0, 0.005), STOP_PCT_RANGE[0], STOP_PCT_RANGE[1])
+    if random.random() < indpb:
+        individual[1] = np.clip(individual[1] + random.gauss(0, 0.005), PROFIT_PCT_RANGE[0], PROFIT_PCT_RANGE[1])
+    for i in range(2, len(individual)):
+        if random.random() < (indpb / 10.0): 
+            individual[i] = np.clip(individual[i] + random.gauss(0, (max_p - min_p) * 0.01), min_p, max_p)
+    return individual,
+
+# --- 5. Reporting ---
+def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_curve, test_trades, hourly_log, live_logs=[], live_trades=[]):
+    plt.figure(figsize=(14, 12))
+    
+    # 1. Equity Curve
+    plt.subplot(2, 1, 1)
+    plt.title(f"{symbol} Equity Curve: Training (Blue) vs Test (Orange)")
+    plt.plot(train_curve, label='Training Equity')
+    plt.plot(range(len(train_curve), len(train_curve)+len(test_curve)), test_curve, label='Test Equity')
+    plt.legend()
+    plt.grid(True)
+    
+    # 2. Full Price Action
+    plt.subplot(2, 1, 2)
+    plt.title(f"{symbol} Test Set Price Action & Grid Lines")
+    plt.plot(test_data.index, test_data['close'], color='black', alpha=0.6, label='Price', linewidth=0.8)
+    
+    lines = best_ind[2:]
+    min_test = test_data['low'].min()
+    max_test = test_data['high'].max()
+    margin = (max_test - min_test) * 0.1
+    visible_lines = [l for l in lines if (min_test - margin) < l < (max_test + margin)]
+    
+    for l in visible_lines:
+        plt.axhline(y=l, color='blue', alpha=0.1, linewidth=0.5)
+    
+    plt.tight_layout()
+    
+    img_io = io.BytesIO()
+    plt.savefig(img_io, format='png', dpi=100)
+    img_io.seek(0)
+    plot_url = base64.b64encode(img_io.getvalue()).decode()
+    plt.close()
+    
+    trades_df = pd.DataFrame(test_trades)
+    trades_html = trades_df.to_html(classes='table table-striped table-sm', index=False, max_rows=500) if not trades_df.empty else "No trades."
+    
+    hourly_df = pd.DataFrame(hourly_log)
+    hourly_html = hourly_df.to_html(classes='table table-bordered table-sm table-hover', index=False) if not hourly_df.empty else "No hourly data recorded."
+
+    live_log_df = pd.DataFrame(live_logs)
+    live_log_html = live_log_df.to_html(classes='table table-bordered table-sm table-hover', index=False) if not live_log_df.empty else "Waiting for next minute trigger..."
+    
+    live_trades_df = pd.DataFrame(live_trades)
+    live_trades_html = live_trades_df.to_html(classes='table table-striped table-sm', index=False) if not live_trades_df.empty else "No live trades yet."
+
+    params_html = f"""
+    <ul class="list-group">
+        <li class="list-group-item"><strong>Stop Loss:</strong> {best_ind[0]*100:.4f}%</li>
+        <li class="list-group-item"><strong>Take Profit:</strong> {best_ind[1]*100:.4f}%</li>
+        <li class="list-group-item"><strong>Active Grid Lines:</strong> {N_LINES}</li>
+        <li class="list-group-item"><a href="/api/parameters?symbol={symbol}" target="_blank">View JSON Parameters</a></li>
+    </ul>
     """
-    Appends the prediction to CSV and Global Memory.
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{symbol} Strategy Results</title>
+        <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+        <meta http-equiv="refresh" content="30"> 
+        <style>body {{ padding: 20px; }} h3 {{ margin-top: 30px; }} th {{ position: sticky; top: 0; background: white; }}</style>
+    </head>
+    <body>
+        <div class="container-fluid">
+            <a href="/" class="btn btn-secondary mb-3">&larr; Back to Dashboard</a>
+            <h1 class="mb-4">{symbol} Grid Strategy GA Results</h1>
+            <div class="row">
+                <div class="col-md-4">{params_html}</div>
+                <div class="col-md-8 text-right">
+                    <h5>Test Sharpe: {calculate_sharpe(test_curve):.4f}</h5>
+                </div>
+            </div>
+            <hr>
+            <h3>Performance Charts</h3>
+            <img src="data:image/png;base64,{plot_url}" class="img-fluid border rounded">
+            
+            <hr>
+            <div id="live-section" style="background-color: #f8f9fa; padding: 15px; border-left: 5px solid #28a745;">
+                <h2 class="text-success">{symbol} Live Forward Test (Binance 1m)</h2>
+                <p><strong>Status:</strong> Running. Fetches candle at XX:XX:05 (Every Minute).</p>
+                <div class="row">
+                    <div class="col-md-6">
+                        <h4>Live Minute State</h4>
+                        <div style="max-height: 400px; overflow-y: scroll; border: 1px solid #ddd; background: white;">
+                            {live_log_html}
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <h4>Live Trade Log</h4>
+                         <div style="max-height: 400px; overflow-y: scroll; border: 1px solid #ddd; background: white;">
+                            {live_trades_html}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <hr>
+            <h3>Trade Log (Test Set)</h3>
+            <div style="max-height: 400px; overflow-y: scroll; border: 1px solid #ddd;">{trades_html}</div>
+            
+            <hr>
+            <h3>Hourly Details (First 5 Trades Timeline)</h3>
+            <div style="max-height: 600px; overflow-y: scroll; border: 1px solid #ddd;">
+                {hourly_html}
+            </div>
+        </div>
+    </body>
+    </html>
     """
-    file_exists = os.path.isfile("live_prediction_log.csv")
-    
-    # 1. Write to CSV
-    with open("live_prediction_log.csv", "a") as f:
-        if not file_exists:
-            f.write("timestamp,close_price,sequence_t2,sequence_t1,sequence_t0,prediction\n")
-        seq_str = f"{sequence[0]}|{sequence[1]}|{sequence[2]}" # Using pipe to simplify reading
-        f.write(f"{timestamp},{close_price},{seq_str},{prediction}\n")
-    
-    # 2. Update In-Memory List
-    GLOBAL_LIVE_LOG.append({
-        'timestamp': str(timestamp),
-        'close_price': close_price,
-        'sequence': str(sequence),
-        'prediction': prediction
-    })
-    
-    print(f"Logged prediction: {prediction} for seq {sequence}")
+    return html_content
 
-def load_existing_logs():
-    """Reads existing CSV logs into memory on startup."""
-    if os.path.isfile("live_prediction_log.csv"):
-        try:
-            with open("live_prediction_log.csv", "r") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    # Reconstruct readable format
-                    try:
-                        seq_raw = f"({row['sequence_t2']}, {row['sequence_t1']}, {row['sequence_t0']})"
-                    except KeyError:
-                        # Handle old format if exists or simplified
-                        seq_raw = row.get('sequence_t2', 'n/a')
-                        
-                    GLOBAL_LIVE_LOG.append({
-                        'timestamp': row['timestamp'],
-                        'close_price': row['close_price'],
-                        'sequence': seq_raw,
-                        'prediction': row['prediction']
-                    })
-            print(f"Loaded {len(GLOBAL_LIVE_LOG)} existing live logs.")
-        except Exception as e:
-            print(f"Error loading existing logs: {e}")
+# --- 6. Live Forward Test Logic (1 Minute Update) ---
+def fetch_binance_candle(symbol_pair):
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {
+            'symbol': symbol_pair,
+            'interval': '1m', # CHANGED TO 1 MINUTE
+            'limit': 2 
+        }
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if len(data) >= 2:
+            kline = data[-2] 
+            ts = pd.to_datetime(kline[0], unit='ms')
+            high_price = float(kline[2])
+            low_price = float(kline[3])
+            close_price = float(kline[4])
+            return ts, close_price, high_price, low_price
+        return None, None, None, None
+    except Exception as e:
+        print(f"[{symbol_pair}] Binance API Error: {e}")
+        return None, None, None, None
 
-def live_loop():
-    print(f"\n--- Starting Live Prediction Loop for {SYMBOL} ---")
+def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, train_df, test_df, train_curve, test_curve, test_trades, hourly_log):
     
-    if not GLOBAL_MODEL or GLOBAL_GRID_SIZE == 0:
-        print("Error: Global model not trained. Live loop aborting.")
-        return
-
+    stop_pct = best_ind[0]
+    profit_pct = best_ind[1]
+    lines = np.sort(np.array(best_ind[2:]))
+    
+    live_equity = initial_equity
+    live_position = 0 
+    live_entry_price = 0.0
+    prev_close = start_price
+    
+    live_logs = []
+    live_trades = []
+    
+    # Stagger start to avoid rate limits
+    time.sleep(random.uniform(1, 10))
+    print(f"[{symbol}] Live Trading Daemon Started (1m interval).")
+    
     while True:
         now = datetime.now()
-        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        fetch_time = next_hour + timedelta(seconds=5)
-        sleep_seconds = (fetch_time - now).total_seconds()
+        # Sleep until next MINUTE + 5 seconds
+        next_run = (now + timedelta(minutes=1)).replace(second=5, microsecond=0)
         
-        print(f"\n[Live] Current time: {now.strftime('%H:%M:%S')}")
-        print(f"[Live] Sleeping for {sleep_seconds:.0f} seconds until {fetch_time.strftime('%H:%M:%S')}...")
+        if next_run <= now:
+            next_run += timedelta(minutes=1)
+            
+        sleep_sec = (next_run - now).total_seconds()
+        # Add tiny random jitter to avoid exact sync
+        sleep_sec += random.uniform(0.1, 1.0)
         
-        time.sleep(sleep_seconds)
+        time.sleep(sleep_sec)
         
-        print(f"\n[Live] Waking up. Fetching recent candles for {SYMBOL}...")
-        df_live = fetch_binance_data(SYMBOL, INTERVAL, start_str=None, end_str=None)
+        ts, current_c, current_h, current_l = fetch_binance_candle(pair)
         
-        if len(df_live) < 3:
-            print("[Live] Error: Not enough data fetched to form sequence.")
+        if current_c is None:
+            print(f"[{symbol}] Failed to fetch data. Skipping.")
             continue
             
-        try:
-            completed_df = df_live.iloc[:-1].tail(3).copy()
-            if len(completed_df) < 3: continue
-
-            closes = completed_df['close'].values
-            rounded_closes = ((closes / GLOBAL_GRID_SIZE).round() * GLOBAL_GRID_SIZE).round(GLOBAL_PRECISION)
-            
-            seq = (rounded_closes[0], rounded_closes[1], rounded_closes[2])
-            prediction = GLOBAL_MODEL.get(seq, 'FLAT')
-            
-            last_close_time = completed_df['open_time'].iloc[-1]
-            save_live_prediction(last_close_time, closes[-1], seq, prediction)
-            
-            print(f"[Live] Candle Closed: {closes[-1]} | Pred: {prediction}")
-            
-        except Exception as e:
-            print(f"[Live] Error during processing: {e}")
-
-# ---------------------------------------------------------
-# Execution
-# ---------------------------------------------------------
-if __name__ == "__main__":
-    # 0. Load existing logs
-    load_existing_logs()
-
-    # 1. Backtest & Optimization
-    df_main = fetch_binance_data(SYMBOL, INTERVAL, START_TIME, END_TIME)
-    
-    if df_main.empty:
-        print("No data fetched. Exiting.")
-        sys.exit(1)
+        print(f"[{symbol}] Processing {ts} Close: {current_c} High: {current_h} Low: {current_l}")
         
-    best_result = run_grid_search(df_main)
-    GLOBAL_BEST_RESULT = best_result
-    GLOBAL_GRID_SIZE = best_result['grid_size']
-    GLOBAL_PRECISION = best_result['needed_precision']
+        idx = np.searchsorted(lines, current_c)
+        val_below = lines[idx-1] if idx > 0 else -999.0
+        val_above = lines[idx] if idx < len(lines) else 999999.0
+        
+        act_sl = np.nan
+        act_tp = np.nan
+        pos_str = "FLAT"
+        
+        if live_position == 1:
+            pos_str = "LONG"
+            act_sl = live_entry_price * (1 - stop_pct)
+            act_tp = live_entry_price * (1 + profit_pct)
+        elif live_position == -1:
+            pos_str = "SHORT"
+            act_sl = live_entry_price * (1 + stop_pct)
+            act_tp = live_entry_price * (1 - profit_pct)
+            
+        log_entry = {
+            "Timestamp": str(ts),
+            "Price": f"{current_c:.2f}",
+            "Nearest Below": f"{val_below:.2f}" if val_below != -999 else "None",
+            "Nearest Above": f"{val_above:.2f}" if val_above != 999999 else "None",
+            "Position": pos_str,
+            "Active SL": f"{act_sl:.2f}" if not np.isnan(act_sl) else "-",
+            "Active TP": f"{act_tp:.2f}" if not np.isnan(act_tp) else "-",
+            "Equity": f"{live_equity:.2f}"
+        }
+        live_logs.append(log_entry)
+        
+        if live_position != 0:
+            sl_hit = False
+            tp_hit = False
+            exit_price = 0.0
+            reason = ""
+
+            if live_position == 1:
+                sl_price = live_entry_price * (1 - stop_pct)
+                tp_price = live_entry_price * (1 + profit_pct)
+                # Use candle High/Low for exit checks
+                if current_l <= sl_price:
+                    sl_hit = True; exit_price = sl_price
+                elif current_h >= tp_price:
+                    tp_hit = True; exit_price = tp_price
+
+            elif live_position == -1:
+                sl_price = live_entry_price * (1 + stop_pct)
+                tp_price = live_entry_price * (1 - profit_pct)
+                # Use candle High/Low for exit checks
+                if current_h >= sl_price:
+                    sl_hit = True; exit_price = sl_price
+                elif current_l <= tp_price:
+                    tp_hit = True; exit_price = tp_price
+            
+            if sl_hit or tp_hit:
+                if live_position == 1: pn_l = (exit_price - live_entry_price) / live_entry_price
+                else: pn_l = (live_entry_price - exit_price) / live_entry_price
+                
+                live_equity *= (1 + pn_l)
+                reason = "SL" if sl_hit else "TP"
+                live_trades.append({'time': ts, 'type': 'Exit', 'price': exit_price, 'pnl': pn_l, 'equity': live_equity, 'reason': reason})
+                live_position = 0
+                
+                prev_close = current_c
+                with REPORT_LOCK:
+                    HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
+                continue
+
+        if live_position == 0:
+            p_min = min(prev_close, current_c)
+            p_max = max(prev_close, current_c)
+            
+            idx_start = np.searchsorted(lines, p_min, side='right')
+            idx_end = np.searchsorted(lines, p_max, side='right')
+            crossed_lines = lines[idx_start:idx_end]
+            
+            if len(crossed_lines) > 0:
+                target_line = 0.0
+                new_pos = 0
+                if current_c > prev_close:
+                    target_line = crossed_lines[0]
+                    new_pos = -1
+                elif current_c < prev_close:
+                    target_line = crossed_lines[-1]
+                    new_pos = 1
+                
+                if new_pos != 0:
+                    live_position = new_pos
+                    live_entry_price = target_line
+                    live_trades.append({'time': ts, 'type': 'Short' if live_position == -1 else 'Long', 'price': live_entry_price, 'pnl': 0, 'equity': live_equity, 'reason': 'Entry'})
+
+        prev_close = current_c
+        with REPORT_LOCK:
+            HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
+
+# --- 7. Server Handler ---
+class ResultsHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        path = parsed_path.path
+        query = urllib.parse.parse_qs(parsed_path.query)
+
+        if path == '/api/parameters':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            symbol = query.get('symbol', [None])[0]
+            if symbol and symbol in BEST_PARAMS:
+                self.wfile.write(json.dumps(BEST_PARAMS[symbol]).encode('utf-8'))
+            else:
+                self.wfile.write(json.dumps(BEST_PARAMS).encode('utf-8'))
+                
+        elif path.startswith('/report/'):
+            symbol = path.split('/')[-1]
+            if symbol in HTML_REPORTS:
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                with REPORT_LOCK:
+                    self.wfile.write(HTML_REPORTS[symbol].encode('utf-8'))
+            else:
+                self.send_error(404, "Report not found for symbol")
+                
+        elif path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            
+            # Dashboard Index
+            links = ""
+            for asset in ASSETS:
+                sym = asset['symbol']
+                if sym in HTML_REPORTS:
+                    links += f'<a href="/report/{sym}" class="list-group-item list-group-item-action">{sym} Strategy Report</a>'
+                else:
+                    links += f'<div class="list-group-item list-group-item-light">{sym} (Initializing...)</div>'
+            
+            dashboard = f"""
+            <html>
+            <head>
+                <title>Multi-Asset Grid Bot</title>
+                <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+                <meta http-equiv="refresh" content="30">
+            </head>
+            <body class="p-5">
+                <h1>Active Grid Strategies</h1>
+                <div class="list-group mt-4">
+                    {links}
+                </div>
+            </body>
+            </html>
+            """
+            self.wfile.write(dashboard.encode('utf-8'))
+        else:
+            self.send_error(404)
+
+# --- 8. Main Execution Loop ---
+def process_asset(asset_config):
+    sym = asset_config['symbol']
+    csv = asset_config['csv']
+    pair = asset_config['pair']
     
-    # 2. Re-train full model for live use
-    print("Training final model for live use...")
-    GLOBAL_MODEL = train_model(df_main, GLOBAL_GRID_SIZE, GLOBAL_PRECISION)
+    print(f"\n--- Starting Optimization for {sym} ---")
     
-    # 3. Generate Plot
-    print("Generating plot for best result...")
-    GLOBAL_PLOT_B64 = create_plot(
-        df_main, 
-        best_result['test_results'], 
-        best_result['accuracy'], 
-        best_result['cumulative_pnl'],
-        SYMBOL,
-        best_result['grid_percent']
+    # 1. Get Data
+    train_df, test_df = get_data(csv)
+    if train_df is None:
+        print(f"Skipping {sym} due to data error.")
+        return
+
+    # 2. Setup GA
+    min_p, max_p = train_df['close'].min(), train_df['close'].max()
+    toolbox = setup_toolbox(min_p, max_p, train_df)
+
+    # 3. Run GA
+    pop = toolbox.population(n=POPULATION_SIZE)
+    hof = tools.HallOfFame(1)
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("avg", np.mean)
+    stats.register("max", np.max)
+    
+    print(f"[{sym}] Evolving...")
+    algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=GENERATIONS, stats=stats, halloffame=hof, verbose=False)
+    
+    best_ind = hof[0]
+    print(f"[{sym}] Best Sharpe: {best_ind.fitness.values[0]:.4f}")
+
+    # 4. Save Params
+    BEST_PARAMS[sym] = {
+        "stop_percent": best_ind[0],
+        "profit_percent": best_ind[1],
+        "line_prices": list(best_ind[2:])
+    }
+
+    # 5. Final Tests
+    train_curve, _, _ = run_backtest(train_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=0)
+    test_curve, test_trades, hourly_log = run_backtest(test_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=5)
+    
+    # 6. Generate Initial Report
+    with REPORT_LOCK:
+        HTML_REPORTS[sym] = generate_report(sym, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log)
+
+    # 7. Start Live Thread
+    last_test_close = test_df['close'].iloc[-1]
+    t = threading.Thread(
+        target=live_trading_daemon, 
+        args=(sym, pair, best_ind, 10000.0, last_test_close, train_df, test_df, train_curve, test_curve, test_trades, hourly_log),
+        daemon=True
     )
+    t.start()
+    print(f"[{sym}] Live thread launched.")
+
+if __name__ == "__main__":
+    print("Initializing Multi-Asset Grid System...")
     
-    # 4. Start Server
-    server_thread = threading.Thread(target=lambda: socketserver.TCPServer(("", PORT), BacktestHandler).serve_forever())
-    server_thread.daemon = True
-    server_thread.start()
+    # Process assets sequentially for GA to avoid massive CPU contention,
+    # then spawn threads for live waiting.
+    for asset in ASSETS:
+        process_asset(asset)
     
-    print(f"Server running at http://localhost:{PORT}")
+    print("\nAll assets processed. Starting Web Server...")
+    print(f"Serving Dashboard at http://localhost:{PORT}/")
     
-    # 5. Live Loop
-    try:
-        live_loop()
-    except KeyboardInterrupt:
-        print("\nStopping...")
-        sys.exit(0)
+    with socketserver.TCPServer(("", PORT), ResultsHandler) as httpd:
+        try: httpd.serve_forever()
+        except KeyboardInterrupt: httpd.server_close()
