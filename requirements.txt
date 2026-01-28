@@ -1,7 +1,5 @@
-scikit-learn
-requests
-ccxt
 pandas
 numpy
 matplotlib
-Flask
+deap
+requests
